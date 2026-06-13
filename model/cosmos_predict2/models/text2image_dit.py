@@ -37,10 +37,12 @@ from torch.utils.checkpoint import (
     create_selective_checkpoint_contexts,
 )
 from torchvision import transforms
-from transformer_engine.pytorch.attention import (
-    DotProductAttention,
-    apply_rotary_pos_emb,
-)
+from transformer_engine.pytorch.attention import DotProductAttention
+
+try:
+    from transformer_engine.pytorch.attention import apply_rotary_pos_emb
+except ImportError:  # TE >= 2.x moved it to the rope submodule
+    from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
 
 from cosmos_predict2.conditioner import DataType
 from cosmos_predict2.module.a2a_cp import MinimalA2AAttnOp
@@ -322,9 +324,20 @@ class Attention(nn.Module):
         elif self.backend == "torch":
             self.attn_op = torch_attention_op
         elif self.backend == "flash_attn_no_cp":
-            from flash_attn.flash_attn_interface import flash_attn_func
+            try:
+                from flash_attn.flash_attn_interface import flash_attn_func
 
-            self.attn_op = flash_attn_func
+                self.attn_op = flash_attn_func
+            except ImportError:  # flash-attn unavailable (e.g. Blackwell): torch SDPA, same [B,S,H,D] I/O
+                import torch.nn.functional as _F
+
+                def _flash_attn_func_fallback(q, k, v, *args, **kwargs):
+                    out = _F.scaled_dot_product_attention(
+                        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                    )
+                    return out.transpose(1, 2)
+
+                self.attn_op = _flash_attn_func_fallback
         else:
             raise NotImplementedError(self.backend)
 

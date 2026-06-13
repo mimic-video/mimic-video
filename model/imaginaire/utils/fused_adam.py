@@ -14,7 +14,10 @@
 # limitations under the License.
 
 import torch
-from apex.multi_tensor_apply import multi_tensor_applier
+try:
+    from apex.multi_tensor_apply import multi_tensor_applier
+except Exception:
+    multi_tensor_applier = None  # apex is training-only, not needed for eval
 
 from imaginaire.utils import distributed, log
 

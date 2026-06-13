@@ -24,7 +24,7 @@ authors = [
   {name = "NVIDIA Corporation"},
 ]
 description = "Cosmos World Foundation Model"
-requires-python = "==3.10.*"
+requires-python = ">=3.10,<3.15"
 license = {text = "Apache-2.0"}
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -75,7 +75,7 @@ dependencies = [
   "threadpoolctl==3.6.0",
   "tqdm==4.66.5",
   "transformers==4.51.3",
-  "triton==3.2.0",
+  "triton>=3.2",
   "tyro==1.0.8",
   "webdataset==0.2.111",
 ]
@@ -122,7 +122,7 @@ repository = "https://github.com/nvidia-cosmos/cosmos-predict2"
 
 [tool.uv]
 environments = [
-  "python_version == '3.10' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 no-build-package = [
   "apex",
@@ -131,7 +131,7 @@ no-build-package = [
   "transformer-engine",
 ]
 required-environments = [
-    "python_version == '3.10' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [tool.uv.sources]

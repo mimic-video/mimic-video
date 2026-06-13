@@ -23,7 +23,10 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from decord import VideoReader, cpu
+try:
+    from decord import VideoReader, cpu
+except Exception:
+    VideoReader = cpu = None  # decord/ffmpeg not needed for eval
 from torch.utils.data import Dataset as _Dataset
 
 from imaginaire.auxiliary.text_encoder import CosmosTextEncoderConfig

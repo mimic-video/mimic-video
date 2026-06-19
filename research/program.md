@@ -1,59 +1,72 @@
-# Autoresearch: Cosmos-Predict2 video-backbone finetuning on fr3_munich
+# Autoresearch: Cosmos-Predict2 video-backbone finetuning on fr3_munich (multi-GPU)
 
-You are an autonomous ML researcher. Your job: **finetune the video backbone of mimic-video
-(Cosmos-Predict2 2B) on the `fr3_munich` dataset and drive the validation loss as low as
-possible.** You run as ONE experiment per invocation, then exit — a bash loop re-invokes you.
+You are an autonomous ML researcher with **all GPUs on this machine** at your disposal. Your job:
+**finetune the video backbone of mimic-video (Cosmos-Predict2 2B) on `fr3_munich` and drive the
+validation loss as low as possible.** You run ONE *cycle* per invocation, then exit — a bash loop
+re-invokes you.
+
+A cycle = launch up to N experiments **in parallel across the GPUs**, wait for them, then keep/log.
 
 ## The rules (read every time)
 
-- **You edit ONLY** `model/cosmos_predict2/configs/experiment/video2world.py` (hyperparameters:
-  learning rate, LoRA rank/alpha/targets, optimizer, schedule, batch size, augmentation, noise
-  schedule, conditioning, etc.). Model architecture knobs in the config are fair game.
-- **You must NOT touch** `research/train_bounded.sh`, `research/env.sh`, the val split
-  (`val_ratio` in `data_video.py`), or anything under `cosmos_predict2/data/` that defines the
-  metric. Changing how the metric is measured is cheating and is forbidden.
-- The metric is **`val_loss`** (lower is better), printed by `train_bounded.sh` as the single
-  line `val_loss: <float>`. Decisions are made on this number ONLY.
-- Each run has a **fixed training-time budget** (set in `train_bounded.sh`, currently 15 min,
-  excluding model load). Do not change it.
-- **VRAM** is a soft cap (96 GB). Some increase is fine for real gains; don't blow it up.
-- **Simplicity**: prefer changes that are simple. A tiny gain that adds ugly complexity is not
-  worth it; a simplification that holds val_loss is a win.
+- **You edit ONLY** `model/cosmos_predict2/configs/experiment/video2world.py` (learning rate, LoRA
+  rank/alpha/targets, optimizer, schedule, batch size, noise schedule, conditioning, etc.).
+- **You must NOT touch** `research/train_bounded.sh`, `research/env.sh`, the val split (`val_ratio`
+  in `data_video.py`), or the `ValLossLogger` metric. Changing how the metric is measured is cheating.
+- The metric is **`val_loss`** (lower is better). Each run prints its own `val_loss: <float>`.
+- Each run has a fixed training-time budget (set in `train_bounded.sh`; do not change it).
+- **VRAM** soft cap is 96 GB *per GPU*. **Every run logs its own `val_loss` row** in results.tsv.
 
-## One iteration (do exactly this, then STOP)
+## Your GPUs and how to use them
+
+Count them first: `nvidia-smi -L`  (call it N, typically 8).
+
+Each cycle, **you decide the allocation** — total GPUs used across concurrent runs must be ≤ N:
+- **Max exploration (default):** 1 GPU per experiment → up to N experiments at once (`GPUS=0`, `GPUS=1`, …).
+- **Faster single experiment:** group GPUs into one DDP run (`GPUS=0,1,2,3` → 4-way DDP, effective
+  batch = BATCH_SIZE × 4). Fewer experiments per cycle, each finishes sooner.
+- Mix freely (e.g. two 2-GPU DDP runs + four 1-GPU runs = 8 GPUs).
+
+For small-data finetuning, **prefer many 1-GPU experiments** (explore more ideas) over big DDP runs.
+
+## How to launch several experiments at once
+
+Experiment configs are auto-generated from the `lrs`, `ranks`, `bszs` arrays in `video2world.py`.
+To try K configs in one cycle, put K values in those arrays — e.g. `lrs = np.array([1e-4, 3e-4,
+5e-4, 7e-4, 1e-3])` generates 5 experiments. Each experiment's name follows:
+`v2w_fr3_munich_lora_rank{RANK}_lr{LR:.3e}_bsz{BSZ}`  (e.g. `v2w_fr3_munich_lora_rank256_lr3.000e-04_bsz32`).
+
+## One cycle (do exactly this, then STOP)
 
 1. `cd ~/mimic-video`. Read `research/results.tsv`, the tail of `research/PROGRESS.md`, and
-   `research/IDEAS.md` to see what's been tried and what the current best is.
-2. Pick the **single** most promising untried idea from IDEAS.md (or a better one you reason out).
-3. Edit `model/cosmos_predict2/configs/experiment/video2world.py` to implement it.
-4. `git add -A && git commit -m "exp: <one-line description>"` (commit BEFORE running).
-5. Run the experiment:
-   `bash research/train_bounded.sh v2w_fr3_munich_lora_rank256_lr1.778e-04_bsz32 > research/run.log 2>&1`
-   (the experiment name changes if you change rank/lr/bsz — derive it from the config; or pass the
-   name `train_bounded.sh` prints on a dry run).
-6. `grep '^val_loss:' research/run.log`.
-   - **Empty** → the run crashed. `tail -n 60 research/run.log` to read the traceback. If it's a
-     trivial fix (typo, OOM → lower batch size), fix and re-run once. If the idea is fundamentally
-     broken, record `crash` and move on. Then **revert**: `git reset --hard HEAD~1`. STOP.
-7. Compare `val_loss` to the current best in `results.tsv`:
-   - **Improved (lower)** → keep the commit. Update `results.tsv` and append a PROGRESS.md note.
-     If it's a new global best, also run `bash research/upload_best.sh` to push the checkpoint to HF.
-   - **Worse or equal** → `git reset --hard HEAD~1` (discard). Still log the attempt to results.tsv
-     with status `discard`.
-8. Append one row to `research/results.tsv` (TAB-separated) and a short paragraph to
-   `research/PROGRESS.md` (what you tried, the number, keep/discard, why).
-9. **STOP.** Do not start another experiment — the loop will re-invoke you. Never ask the human
-   anything; they are away and you are fully autonomous.
+   `research/IDEAS.md`. Note the current best `val_loss` and which configs are still untried.
+2. Pick a **set** of experiments for this cycle (1..N of them). Edit `video2world.py` so the arrays
+   generate exactly those experiment configs. Decide the GPU split.
+3. `git add -A && git commit -m "cycle <i>: <the configs you are trying>"` (commit BEFORE running).
+4. Launch each experiment **in the background**, pinned to its GPU(s), each to its own log:
+   ```bash
+   mkdir -p research/runs
+   GPUS=0 RUN_TAG=run_lr1e-4 bash research/train_bounded.sh v2w_fr3_munich_lora_rank256_lr1.000e-04_bsz32 > research/runs/run_lr1e-4.log 2>&1 &
+   GPUS=1 RUN_TAG=run_lr3e-4 bash research/train_bounded.sh v2w_fr3_munich_lora_rank256_lr3.000e-04_bsz32 > research/runs/run_lr3e-4.log 2>&1 &
+   # ... up to GPU N-1; or a DDP run: GPUS=0,1,2,3 RUN_TAG=run_ddp BATCH_SIZE=2 bash research/train_bounded.sh <exp> > research/runs/run_ddp.log 2>&1 &
+   wait   # block until ALL launched runs finish
+   ```
+5. For **each** run: `grep '^val_loss:' research/runs/<tag>.log | tail -1`.
+   - Empty → that run crashed. `tail -n 60 research/runs/<tag>.log`. If trivial (OOM → lower BATCH_SIZE,
+     typo), fix and re-run just that one once. Otherwise log it as `crash` and move on.
+6. Append **one results.tsv row per run** (TAB-separated): `commit  val_loss  vram_gb  status  description`.
+   status ∈ {keep, discard, crash}. Every run gets its own row and its own val_loss — never merge runs.
+7. Find the cycle's best run. If it beats the global best, keep the commit and narrow the search arrays
+   toward that region for the next cycle; also run `RUN_TAG=<best_tag> bash research/upload_best.sh`.
+   If nothing beat the best, `git reset --hard HEAD~1` (discard the cycle's config edit).
+8. Append a short paragraph to `research/PROGRESS.md` (the configs tried, each val_loss, what won, next idea).
+9. **STOP.** Never ask the human anything — they are away and you are fully autonomous. The loop re-invokes you.
 
 ## results.tsv columns (TAB-separated)
-
-`commit<TAB>val_loss<TAB>vram_gb<TAB>status<TAB>description`
-- status ∈ {keep, discard, crash}. Use val_loss `0.000000` and vram `0.0` for crashes.
+`commit<TAB>val_loss<TAB>vram_gb<TAB>status<TAB>description` — use `0.000000`/`0.0` for crashes.
 
 ## Context
-
 - Task: single cutlery-sort task, 62 episodes (58 train / 4 held-out val), top camera, 480×640, 30fps.
-- Base: raw `v2w_pretrained_cosmos.pt`; finetune via LoRA on the video DiT (or try full-ft).
-- Env: built with `(cd model && uv sync --extra cu130)`; runtime vars via `research/env.sh`
-  (already sourced by `train_bounded.sh`). Deps are managed with **uv only** — never pip-install.
-- The baseline (first ever run) is the unmodified config; record it before tuning.
+- Base: raw `v2w_pretrained_cosmos.pt`; LoRA on the video DiT (or try full-ft, `train_architecture="base"`).
+- The very first cycle should establish the **baseline** (unmodified config, one run) before tuning.
+- Env is auto-sourced by `train_bounded.sh`; deps are uv-managed — never pip-install anything.

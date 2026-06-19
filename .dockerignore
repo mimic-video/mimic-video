@@ -1,0 +1,14 @@
+# Keep the image build context tiny — it only needs model/pyproject.toml + model/uv.lock.
+.git
+datasets/
+model/checkpoints/
+model/.venv/
+**/.venv/
+**/__pycache__/
+eval/
+autoresearch/
+research/runs/
+research/run.log
+research/loop.console.log
+research/*.log
+*.log

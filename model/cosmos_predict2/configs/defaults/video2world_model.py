@@ -53,3 +53,11 @@ def register_model() -> None:
         name="v2w_pretrained_cosmos",
         node=_PREDICT2_VIDEO2WORLD_DDP_2B_480P_10FPS,
     )
+    # Distinct name so the video-backbone trainer (Predict2Video2WorldModel) is not shadowed by
+    # world2action_model.py's same-named "v2w_pretrained_cosmos" (the action-decoder model).
+    cs.store(
+        group="model",
+        package="_global_",
+        name="v2w_video2world_finetune",
+        node=_PREDICT2_VIDEO2WORLD_DDP_2B_480P_10FPS,
+    )

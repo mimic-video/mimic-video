@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# The autoresearch engine: spawn a FRESH opencode/MiniMax agent per iteration, each doing exactly
+# one experiment (per research/program.md) then exiting. State lives in git + the research/*.md/tsv
+# files, NOT in any single agent's context. Run detached:  nohup bash research/loop.sh &>/dev/null &
+set -uo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO"
+
+OPENCODE="${OPENCODE_BIN:-$HOME/.opencode/bin/opencode}"
+MODEL="${OPENCODE_MODEL:-microagi-minimax-m3-mxfp4/olka-fi/MiniMax-M3-MXFP4}"
+ITER_TIMEOUT="${ITER_TIMEOUT:-45m}"     # hard cap per iteration (15min train + load + agent reasoning)
+BRANCH="${AR_BRANCH:-autoresearch/munich-$(date +%Y%m%d-%H%M)}"
+
+# Fresh dedicated branch so the loop's commits never touch main.
+git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+echo "[loop] branch=$BRANCH model=$MODEL iter_timeout=$ITER_TIMEOUT"
+
+i=0
+while true; do
+  i=$((i+1))
+  echo "[loop] ===== iteration $i @ $(date -u +%FT%TZ) ====="
+  # A wedged training run or hung agent can never freeze the loop: the timeout reaps it and we continue.
+  timeout "$ITER_TIMEOUT" "$OPENCODE" run --model "$MODEL" \
+    "Read research/program.md and execute exactly ONE experiment iteration, then stop. Do not ask me anything." \
+    >> research/loop.console.log 2>&1
+  echo "[loop] iteration $i exit=$? @ $(date -u +%FT%TZ)"
+  sleep 5
+done

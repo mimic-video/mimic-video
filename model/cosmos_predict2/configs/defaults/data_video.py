@@ -34,6 +34,17 @@ train_datasets: dict[str, Dataset_] = {
         is_val=False,
         obs_history=5,
     ),
+    "fr3_munich": L(Dataset)(
+        # microagi-luca/fr3_munich_left_h264 (LeRobot v3, 62 eps, cutlery-sort) -> top camera,
+        # converted by data_preprocessing/lerobot/convert_video.py. Single camera => is_multi_img=False.
+        dataset_dir="../datasets/fr3_munich_mimic",  # relative to model/ (the training cwd)
+        num_frames=61,
+        video_size=[480, 640],
+        data_fps=30.0,
+        is_val=False,
+        obs_history=5,
+        val_ratio=0.1,  # deterministic held-out split (~6 eps) for the autoresearch val-loss metric
+    ),
     "bridge": L(Dataset)(
         dataset_dir=...,
         num_frames=61,

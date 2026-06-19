@@ -3,6 +3,13 @@ eval/*/results
 nohup.out
 uv.lock
 
+# opencode.json holds the MiniMax API key — keep it local, never commit the secret.
+opencode.json
+# autoresearch runtime logs
+research/run.log
+research/loop.console.log
+research/*.log
+
 __pycache__/
 .venv/
 

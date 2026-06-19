@@ -17,7 +17,7 @@ cd "$MODEL_DIR"
 EXP="${1:-v2w_fr3_munich_lora_rank256_lr1.778e-04_bsz32}"
 GPUS="${GPUS:-0}"
 RUN_TAG="${RUN_TAG:-$EXP}"
-TRAIN_BUDGET_S="${TRAIN_BUDGET_S:-900}"
+TRAIN_BUDGET_S="${TRAIN_BUDGET_S:-7200}"   # per-experiment train budget (2h). Inner hard cap = this + LOAD_GRACE_S.
 LOAD_GRACE_S="${LOAD_GRACE_S:-180}"
 VALIDATION_ITER="${VALIDATION_ITER:-25}"
 BATCH_SIZE="${BATCH_SIZE:-1}"

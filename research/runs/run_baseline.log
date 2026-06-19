@@ -1,0 +1,2 @@
+[train_bounded] run=run_baseline exp=v2w_fr3_munich_lora_rank256_lr1.778e-04_bsz32 gpus=0 (ddp x1) budget=900s val_every=25 bsz=1/gpu
+[train_bounded] started 2026-06-19T21:18:35Z

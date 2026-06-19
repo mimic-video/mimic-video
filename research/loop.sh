@@ -10,11 +10,14 @@ cd "$REPO"
 OPENCODE="${OPENCODE_BIN:-$HOME/.opencode/bin/opencode}"
 MODEL="${OPENCODE_MODEL:-microagi-minimax-m3-mxfp4/olka-fi/MiniMax-M3-MXFP4}"
 ITER_TIMEOUT="${ITER_TIMEOUT:-45m}"     # hard cap per iteration (15min train + load + agent reasoning)
+BASE_BRANCH="${AR_BASE:-autoresearch/setup}"   # stable base: env + harness + this loop. Runs branch off it.
 BRANCH="${AR_BRANCH:-autoresearch/munich-$(date +%Y%m%d-%H%M)}"
 
-# Fresh dedicated branch so the loop's commits never touch main.
-git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
-echo "[loop] branch=$BRANCH model=$MODEL iter_timeout=$ITER_TIMEOUT"
+# Each run gets a fresh branch cut FROM the stable setup base, so experiments never touch
+# main or setup and every run starts from the same known-good state.
+git rev-parse --verify "$BASE_BRANCH" >/dev/null 2>&1 || { echo "[loop] base branch '$BASE_BRANCH' not found"; exit 1; }
+git checkout -b "$BRANCH" "$BASE_BRANCH" 2>/dev/null || git checkout "$BRANCH"
+echo "[loop] branch=$BRANCH (from $BASE_BRANCH) model=$MODEL iter_timeout=$ITER_TIMEOUT"
 
 i=0
 while true; do

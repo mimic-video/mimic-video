@@ -25,6 +25,26 @@ from imaginaire.lazy_config.lazy import LazyConfig
 from imaginaire.utils import distributed
 from imaginaire.utils.config_helper import get_config_module, override
 
+# DataLoader workers share sampled tensors via shared memory; this pod's /dev/shm is only 64MB and
+# our samples are large (full-resolution video clips), so use file-system-backed sharing (temp files
+# under /tmp, ~1.4TB here) to allow num_workers>0 without a "No space left on device" crash.
+import torch  # noqa: E402
+
+torch.multiprocessing.set_sharing_strategy("file_system")
+
+# torch>=2.6 defaults torch.load to weights_only=True, which rejects the numpy scalars stored in this
+# repo's own checkpoints / normalizer + trainer state, so resume (e.g. after a pod restart) fails.
+# These are trusted checkpoints (ours + NVIDIA's), so restore the permissive default.
+_torch_load = torch.load
+
+
+def _torch_load_weights_only_false(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _torch_load(*args, **kwargs)
+
+
+torch.load = _torch_load_weights_only_false
+
 
 @logging.catch(reraise=True)
 def launch(config: Config, args: argparse.Namespace) -> None:

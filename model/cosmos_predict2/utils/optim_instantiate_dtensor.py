@@ -17,7 +17,7 @@ import torch
 from omegaconf import ListConfig
 from torch import nn
 
-from cosmos_predict2.utils.fused_adam_dtensor import FusedAdam
+from cosmos_predict2.utils.fused_adam_dtensor import FusedAdam, multi_tensor_applier
 from imaginaire.utils import log
 
 
@@ -66,5 +66,13 @@ def get_base_optimizer(
     for k, v in kwargs.items():
         if isinstance(v, ListConfig):
             kwargs[k] = list(v)
+
+    # apex FusedAdam is unavailable on this build (e.g. Blackwell / cu13 without apex);
+    # fall back to torch.optim.AdamW and drop the fused-only kwargs it doesn't accept.
+    if opt_cls is FusedAdam and multi_tensor_applier is None:
+        log.warning("apex FusedAdam unavailable (no apex); falling back to torch.optim.AdamW")
+        opt_cls = torch.optim.AdamW
+        for key in ("master_weights", "capturable", "bias_correction", "adam_w_mode"):
+            kwargs.pop(key, None)
 
     return opt_cls(param_group, **kwargs)

@@ -42,6 +42,15 @@ class MockBridgeDataset:
         return "mock_bridge"
 
 
+def _worker_init_filesystem_sharing(worker_id: int) -> None:
+    # Runs inside each DataLoader worker before it shares any tensor back to the main process.
+    # This pod's /dev/shm is only 64MB and samples are large (full-res video clips), so share tensors
+    # via the filesystem (/tmp, ~1.4TB) instead of /dev/shm to avoid "No space left on device".
+    import torch
+
+    torch.multiprocessing.set_sharing_strategy("file_system")
+
+
 def get_data_config(config_name: str):
     omegaconf.OmegaConf.register_new_resolver("eval", eval, replace=True)
     omegaconf.OmegaConf.register_new_resolver("ObsType", ObsType.__getitem__, replace=True)
@@ -107,6 +116,7 @@ def register_training_and_val_action_data():
         pin_memory=True,
         persistent_workers=True,
         in_order=False,
+        worker_init_fn=_worker_init_filesystem_sharing,
     )
     cs.store(
         group="dataloader_train",

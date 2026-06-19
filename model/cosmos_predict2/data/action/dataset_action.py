@@ -20,6 +20,11 @@ from cosmos_predict2.data.action import data_transforms as data_transforms_mod
 from cosmos_predict2.data.action.data_transforms import apply_data_transforms, make_data_transforms
 from cosmos_predict2.data.action.types import LieRepr, NormalizationType, ObsMeta, ObsType
 from cosmos_predict2.data.action.utils import dict_apply, get_paths
+
+# Spawned DataLoader workers reset torch's tensor-sharing to the default /dev/shm-backed strategy;
+# this pod's /dev/shm is only 64MB and samples are large, so force file-system sharing (/tmp, ~1.4TB)
+# here — spawned workers re-import this module, so this runs in each worker.
+torch.multiprocessing.set_sharing_strategy("file_system")
 from cosmos_predict2.module import normalizer
 from cosmos_predict2.module.normalizer import array_to_stats
 

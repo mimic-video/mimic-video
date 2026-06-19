@@ -1,0 +1,39 @@
+# bimanual_fr3 (left arm, top camera) reusing the Bridge dataloading stack verbatim.
+# The zarr produced by data_preprocessing/lerobot/convert_action.py is structurally identical to
+# process_bridge.py's output, so the bridge_to_bridge transform + bridge policy_io apply unchanged.
+defaults:
+  - transform@_here_: bridge_to_bridge_fr3  # native-uint8 transfer + GPU-side resize (small /dev/shm)
+  - _self_
+
+data_components:
+  workspace_rgb:
+    obs_type: ${ObsType:RGB}
+    repr: null
+  eef_pose_lowdim:
+    obs_type: ${ObsType:POSE_MATRIX}
+    repr: ${LieRepr:ABSOLUTE}
+  gripper_state_lowdim:
+    obs_type: ${ObsType:JOINT_POS}
+    repr: ${LieRepr:ABSOLUTE}
+  gripper_action_lowdim:
+    obs_type: ${ObsType:JOINT_POS}
+    repr: ${LieRepr:ABSOLUTE}
+  language_instruction:
+    obs_type: ${ObsType:LANGUAGE}
+    repr: null
+  language_embedding:
+    obs_type: ${ObsType:LANGUAGE_EMBEDDING}
+    repr: null
+
+dataset:
+  _target_: cosmos_predict2.data.action.dataset_action.MimicDataset
+  _convert_: partial
+  data_dir: ../datasets/bimanual_fr3_mimic/action  # relative to model/ (the training cwd); or use an absolute path
+  timestep_anchor: workspace_rgb
+  data_components: ${..data_components}
+  data_transforms: ${..data_transforms}
+  source_component_names: ${..source_component_names}
+  should_include_padded_tails: True
+  seed: 42
+  num_val_episodes: 1  # only 7 episodes total -> keep 6 for training, 1 for val
+  policy_io: ${policy_io.policy_io}

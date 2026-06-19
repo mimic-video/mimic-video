@@ -589,6 +589,16 @@ class Video2WorldPipeline(BasePipeline):
 
         return x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, sigma_B_T
 
+    def _gpu_resize_normalize_video(self, video: torch.Tensor) -> torch.Tensor:
+        # video: (B, C, T, H, W) native-resolution frames (uint8 or [0,255] float). Upscale to the
+        # 480x640 model resolution and normalize to [-1, 1], on the GPU. This lets the DataLoader
+        # workers ship small native-res tensors instead of ~21x larger upscaled-float32 ones.
+        b, c, t, h, w = video.shape
+        x = video.to(self.tensor_kwargs["device"], non_blocking=True).permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        x = torch.nn.functional.interpolate(x.float(), size=(480, 640), mode="bilinear", align_corners=False)
+        x = 2.0 * (x / 255.0 - 0.5)
+        return x.reshape(b, t, c, 480, 640).permute(0, 2, 1, 3, 4).contiguous()
+
     def get_mimic_data_and_condition(
         self, data_batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor, TextCondition]:
@@ -596,6 +606,10 @@ class Video2WorldPipeline(BasePipeline):
             (data_batch["obs/workspace_rgb"], data_batch["action/workspace_rgb"]),
             dim=2,
         )
+        if tuple(raw_state.shape[-2:]) != (480, 640):
+            # Workers ship native-resolution uint8 frames (CosmosProcessImage defer_resize) so only
+            # ~1/21 of the data crosses the /dev/shm DataLoader boundary; upscale + normalize here.
+            raw_state = self._gpu_resize_normalize_video(raw_state)
         latent_state = self.encode(raw_state).contiguous().float()
 
         B, *_, H, W = latent_state.shape

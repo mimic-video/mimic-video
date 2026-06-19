@@ -24,6 +24,16 @@ def get_sampler(dataset) -> ResumableDistributedSampler:
 cs = ConfigStore.instance()
 
 train_datasets: dict[str, Dataset_] = {
+    "fr3": L(Dataset)(
+        # bimanual_fr3 (LeRobot) -> top camera, re-encoded to per-episode H.264 by
+        # data_preprocessing/lerobot/convert_video.py. Single camera => is_multi_img=False.
+        dataset_dir="../datasets/bimanual_fr3_mimic/video",  # relative to model/ (the training cwd)
+        num_frames=61,
+        video_size=[480, 640],
+        data_fps=30.0,  # native fps of the converted mp4s
+        is_val=False,
+        obs_history=5,
+    ),
     "bridge": L(Dataset)(
         dataset_dir=...,
         num_frames=61,

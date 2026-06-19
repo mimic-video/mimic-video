@@ -1077,9 +1077,21 @@ class TokenizerInterface(VideoTokenizerInterface):
     def reset_dtype(self):
         pass
 
+    def _encode_subbatched(self, state: torch.Tensor) -> torch.Tensor:
+        # The VAE's full-resolution 3D convs use cuDNN int32 element indexing; a full clip
+        # (e.g. 61x480x640) at batch>1 exceeds 2**31 elements -> illegal memory access on Blackwell.
+        # Encode in sub-batches small enough to stay under the limit, then concat. Conv is
+        # batch-independent so this is exact; the frozen VAE encode is a small part of each step
+        # while the backbone / action DiT still run at the full batch.
+        b, _, t, h, w = state.shape
+        sub = max(1, min(b, (2**31 - 1) // (128 * t * h * w)))
+        if sub >= b:
+            return self.model.encode(state)
+        return torch.cat([self.model.encode(state[i : i + sub]) for i in range(0, b, sub)], dim=0)
+
     # @torch.compile(dynamic=False); it will significantly slow down the training job
     def encode(self, state: torch.Tensor) -> torch.Tensor:
-        latents = self.model.encode(state)
+        latents = self._encode_subbatched(state)
         num_frames = latents.shape[2]
         if num_frames == 1:
             return (latents - self.model.img_mean.type_as(latents)) / self.model.img_std.type_as(latents)

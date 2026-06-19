@@ -187,7 +187,9 @@ class ChunkReader:
             return None
 
         shift_timesteps = meta["shift_right_by"] * S_TO_NS
-        this_step_timestamp = step_timestamp + shift_timesteps
+        # int() avoids uint64 underflow when the backward (obs) window goes before t=0:
+        # uint64(0) - pred_duration would wrap to ~2**64 instead of a negative timestamp.
+        this_step_timestamp = int(step_timestamp) + shift_timesteps
 
         actual_timestamps = root[f"{key}_timestamps"]
         n_timestamps = len(actual_timestamps)
@@ -220,6 +222,17 @@ class ChunkReader:
         )
 
         actual_timestamps = actual_timestamps[start_idx : end_idx + 1]
+        if len(actual_timestamps) == 0:
+            # Degenerate window: the requested chunk lies entirely outside this component's
+            # available timestamps. Pad by repeating the nearest frame `horizon` times.
+            self._logger.warning(
+                f"empty chunk window key={key} horizon={meta['horizon']} is_action={is_action} "
+                f"start_idx={start_idx} end_idx={end_idx} n={n_timestamps} "
+                f"cs={float(chunk_start_timestamp):.0f} ce={float(chunk_end_timestamp):.0f}"
+            )
+            idx = int(min(max(start_idx, 0), n_timestamps - 1))
+            nearest = root[key][idx]
+            return np.repeat(nearest[None], meta["horizon"], axis=0)
         requested_timestamps = np.linspace(
             chunk_start_timestamp, chunk_end_timestamp, meta["horizon"], dtype=np.float64
         )

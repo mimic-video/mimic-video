@@ -203,18 +203,27 @@ class CosmosProcessImage(DataTransform):
         self,
         resize_sizes: dict[str, tuple[int, int]] | tuple[int, int],
         obs_types: dict[str, ObsType] | None = None,
+        defer_resize: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
         self._resize_sizes = resize_sizes
         self._obs_types = obs_types or {}
+        self._defer_resize = defer_resize
 
     def _get_resize_sizes(self, key: str) -> tuple[int, int]:
         return self._resize_sizes[key] if isinstance(self._resize_sizes, dict) else self._resize_sizes
 
     def __call__(self, targets: list[tuple[str, np.ndarray]]) -> Iterator[tuple[str, np.ndarray]]:
         for key, imgs in targets:
+            if self._defer_resize:
+                # Ship native-resolution uint8 across the DataLoader/shared-memory boundary (~21x
+                # smaller than upscaled float32). The resize to model resolution and the [-1, 1]
+                # normalization are done on the GPU in the pipeline (Video2WorldPipeline), which is
+                # both faster and keeps /dev/shm tiny.
+                yield key, einops.rearrange(imgs, "t h w c -> c t h w")  # (C, T, H, W) uint8, native res
+                continue
             imgs = np.stack(
                 [transforms.Resize(self._get_resize_sizes(key))(PIL.Image.fromarray(img, "RGB")) for img in imgs],
                 axis=0,

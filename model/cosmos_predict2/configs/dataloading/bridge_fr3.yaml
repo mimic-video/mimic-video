@@ -1,0 +1,7 @@
+# Top-level data_config. Filename stem `bridge_fr3` is auto-registered as a data_config and,
+# because it starts with "bridge", the world2action experiment loop maps it to the 10-dim Bridge
+# action decoder net (ACTION_DECODER_NETS["bridge"]) with no code change.
+defaults:
+  - dataset: bridge_fr3
+  - policy_io: bridge
+  - _self_

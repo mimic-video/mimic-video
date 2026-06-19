@@ -25,7 +25,7 @@ from imaginaire.lazy_config import LazyCall as L
 
 BASE: dict = dict(
     defaults=[
-        {"override /model": "predict2_video2world_ddp_2b_480p_10fps"},
+        {"override /model": "v2w_pretrained_cosmos"},  # was: predict2_video2world_ddp_2b_480p_10fps (unregistered)
         {"override /video_dataset_train": MISSING},
         {"override /video_dataset_val": MISSING},
         {"override /dataloader_val": "vanilla"},

@@ -1,0 +1,40 @@
+# Same as bridge_to_bridge, but CosmosProcessImage ships native-resolution uint8 across the
+# DataLoader/shared-memory boundary; the upscale to 480x640 + [-1,1] normalization happen on the GPU
+# in Video2WorldPipeline. This keeps /dev/shm traffic ~21x smaller and speeds up data loading.
+data_transforms:
+  - name: CosmosProcessImage
+    targets: [workspace_rgb]
+    resize_sizes: ${policy_io.img_resize_sizes}
+    defer_resize: true
+
+  - name: ConvertLowdimRepr
+    targets: [action/eef_pose_lowdim]
+    additional_data: { relative_base_value: obs/eef_pose_lowdim }
+    relative_base_value_idx: -1
+
+  - name: DeconstructPoseMat
+    targets: [action/eef_pose_lowdim]
+    out_key_prefix: action/eef
+  - name: DeconstructPoseMat
+    targets: [obs/eef_pose_lowdim]
+    out_key_prefix: obs/eef
+
+  - name: RotationMatrixTo6D
+    targets: [action/eef_rot_lowdim, obs/eef_rot_lowdim]
+
+  - name: Flatten
+    targets: [lowdim]
+
+  - name: Concat
+    targets: ${policy_io.concat_groups.action/lowdim_concat}
+    out_key: "action/lowdim_concat"
+  - name: Concat
+    targets: ${policy_io.concat_groups.obs/lowdim_concat}
+    out_key: "obs/lowdim_concat"
+
+source_component_names:
+  obs/eef_pos_lowdim: eef_pose_lowdim
+  obs/eef_rot_lowdim: eef_pose_lowdim
+
+  action/eef_pos_lowdim: eef_pose_lowdim
+  action/eef_rot_lowdim: eef_pose_lowdim

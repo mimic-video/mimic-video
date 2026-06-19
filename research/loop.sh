@@ -21,9 +21,12 @@ while true; do
   i=$((i+1))
   echo "[loop] ===== iteration $i @ $(date -u +%FT%TZ) ====="
   # A wedged training run or hung agent can never freeze the loop: the timeout reaps it and we continue.
+  # `< /dev/null` is REQUIRED: when launched via `nohup ... &>/dev/null &`, fd 0 is /dev/null opened
+  # WRITE-only, and opencode reading stdin on it throws `EBADF: bad file descriptor, read`. A readable
+  # /dev/null gives a clean EOF instead.
   timeout "$ITER_TIMEOUT" "$OPENCODE" run --model "$MODEL" \
     "Read research/program.md and execute exactly ONE experiment iteration, then stop. Do not ask me anything." \
-    >> research/loop.console.log 2>&1
+    < /dev/null >> research/loop.console.log 2>&1
   echo "[loop] iteration $i exit=$? @ $(date -u +%FT%TZ)"
   sleep 5
 done

@@ -1,1 +1,2 @@
 commit	val_loss	vram_gb	status	description
+512f69a	5.405514	44.06	keep	baseline: lr=1.778e-4, rank=256, bsz=32, 1 GPU (BATCH_SIZE=1), hit 2h budget at iter 2000

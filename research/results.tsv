@@ -1,2 +1,6 @@
 commit	val_loss	vram_gb	status	description
 512f69a	5.405514	44.06	keep	baseline: lr=1.778e-4, rank=256, bsz=32, 1 GPU (BATCH_SIZE=1), hit 2h budget at iter 2000
+482460e	5.152164	0.0	keep	cycle 2 LR sweep: lr=3e-4, rank=256, bsz=32, GPU 1 (NEW BEST — beats baseline 5.405514)
+482460e	12.901524	0.0	discard	cycle 2 LR sweep: lr=1e-4, rank=256, bsz=32, GPU 0 (too low — under-converged in 2h)
+482460e	8.505093	0.0	discard	cycle 2 LR sweep: lr=5e-4, rank=256, bsz=32, GPU 2 (too high — overshoot)
+482460e	19.046690	0.0	discard	cycle 2 LR sweep: lr=1e-3, rank=256, bsz=32, GPU 3 (diverged — train loss exploded)

@@ -1,0 +1,12 @@
+[train_bounded] run=run_lr3e-4 exp=v2w_fr3_munich_lora_rank256_lr3.000e-04_bsz32 gpus=1 (ddp x1) budget=7200s val_every=25 bsz=1/gpu
+[train_bounded] started 2026-06-19T23:43:31Z
+[train_bounded] hit time budget (expected) — using latest validation.
+[train_bounded] last training losses:
+Training:   0%|          | 3/100000000 [00:25<187242:04:02,  6.74s/it][06-19 23:46:03|INFO|cosmos_predict2/callbacks/iter_speed.py:51:on_training_step_end] Iteration 3: Hit counter: 3/5 | Loss: 6.6103 | Time: 3.35s
+Training:   0%|          | 4/100000000 [00:28<149372:51:13,  5.38s/it][06-19 23:46:06|INFO|cosmos_predict2/callbacks/iter_speed.py:51:on_training_step_end] Iteration 4: Hit counter: 4/5 | Loss: 6.4486 | Time: 3.29s
+Training:   0%|          | 5/100000000 [00:31<128702:48:46,  4.63s/it][06-19 23:46:10|INFO|cosmos_predict2/callbacks/iter_speed.py:51:on_training_step_end] Iteration 5: Hit counter: 5/5 | Loss: 11.7141 | Time: 3.31s
+----- train_bounded summary (run_lr3e-4) -----
+run_tag: run_lr3e-4
+val_loss: 5.152164
+num_validations: 108
+[train_bounded] OK 2026-06-20T01:46:38Z

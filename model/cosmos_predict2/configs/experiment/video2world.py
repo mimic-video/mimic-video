@@ -67,7 +67,7 @@ BASE: dict = dict(
     ),
 )
 
-lrs = np.array([1e-4, 3e-4, 5e-4, 1e-3])
+lrs = np.array([2e-4, 2.5e-4, 3e-4, 4e-4])
 bszs = [32]
 ranks = [256]
 

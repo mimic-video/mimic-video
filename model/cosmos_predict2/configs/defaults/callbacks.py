@@ -18,7 +18,9 @@ from hydra.core.config_store import ConfigStore
 from cosmos_predict2.callbacks.device_monitor import DeviceMonitor
 from cosmos_predict2.callbacks.grad_clip import GradClip
 from cosmos_predict2.callbacks.iter_speed import IterSpeed
+from cosmos_predict2.callbacks.profiler import ProfilerCallback
 from cosmos_predict2.callbacks.val_loss_logger import ValLossLogger
+from cosmos_predict2.callbacks.wandb_logger import WandbLogger
 from imaginaire.callbacks.manual_gc import ManualGarbageCollection
 from imaginaire.lazy_config import PLACEHOLDER
 from imaginaire.lazy_config import LazyCall as L
@@ -35,6 +37,8 @@ BASIC_CALLBACKS = dict(
     manual_gc=L(ManualGarbageCollection)(every_n=5),
     grad_clip=L(GradClip)(clip_norm=10.0),
     val_loss=L(ValLossLogger)(),  # autoresearch metric: prints `val_loss: <float>` (frozen)
+    wandb=L(WandbLogger)(every_n=25),  # inert unless env MIMIC_WANDB is set; streams train/val loss to W&B
+    profiler=L(ProfilerCallback)(warmup=5, active=8),  # inert unless env MIMIC_PROFILE is set
 )
 
 

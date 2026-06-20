@@ -272,18 +272,12 @@ class ImaginaireTrainer:
                 if _end_training:
                     break
 
-                if min(iteration % 10_000, 10_000 - (iteration % 10_000)) < 100:
-                    self.checkpointer.save(
-                        model,
-                        optimizer,
-                        scheduler,
-                        grad_scaler,
-                        iteration=iteration,
-                    )
-                if self.config.trainer.run_validation and iteration % self.config.trainer.validation_iter != 0:
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-                    self.validate(model, dataloader_val_cfg, iteration=iteration)
+                # NOTE: the per-epoch-boundary checkpoint + validation that used to live here have
+                # been removed. This dataset is tiny (58 clips / 8 ranks / batch 2 = ~3 iters/epoch),
+                # so those hooks fired every ~3 steps, spamming eval and checkpoints. The in-loop
+                # interval hooks above already save every checkpoint.save_iter and validate every
+                # trainer.validation_iter, and the final save below covers end-of-training — so the
+                # intended cadence holds regardless of epoch length.
 
         log.success("Done with training.")
         if iteration % self.config.checkpoint.save_iter != 0:

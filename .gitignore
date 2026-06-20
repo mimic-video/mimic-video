@@ -9,6 +9,9 @@ opencode.json
 research/run.log
 research/loop.console.log
 research/*.log
+# W&B run data + per-run training/profiling logs (runtime artifacts)
+model/wandb/
+research/runs/
 
 __pycache__/
 .venv/

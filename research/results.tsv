@@ -4,3 +4,7 @@ commit	val_loss	vram_gb	status	description
 482460e	12.901524	0.0	discard	cycle 2 LR sweep: lr=1e-4, rank=256, bsz=32, GPU 0 (too low — under-converged in 2h)
 482460e	8.505093	0.0	discard	cycle 2 LR sweep: lr=5e-4, rank=256, bsz=32, GPU 2 (too high — overshoot)
 482460e	19.046690	0.0	discard	cycle 2 LR sweep: lr=1e-3, rank=256, bsz=32, GPU 3 (diverged — train loss exploded)
+1bbe505	13.048154	0.0	discard	cycle 3 LR narrow: lr=2e-4, rank=256, bsz=32, GPU 0 (last val_loss spiked; median 5.956 — noisy n=4 val clips)
+1bbe505	9.076780	0.0	discard	cycle 3 LR narrow: lr=2.5e-4, rank=256, bsz=32, GPU 1 (last val_loss spiked; median 6.135)
+1bbe505	16.364034	0.0	discard	cycle 3 LR narrow: lr=3e-4, rank=256, bsz=32, GPU 2 (last val_loss spiked; median 6.524 — same config as cycle 2 winner)
+1bbe505	9.804769	0.0	discard	cycle 3 LR narrow: lr=4e-4, rank=256, bsz=32, GPU 3 (last val_loss spiked; median 6.601)

@@ -1,6 +1,11 @@
 from hydra.core.config_store import ConfigStore
 
-from cosmos_predict2.configs.config_world2action import SchedulerConfig, World2ActionPipelineConfig
+from cosmos_predict2.configs.config_world2action import (
+    ActionConditioningConfig,
+    ActionSourcePriorConfig,
+    SchedulerConfig,
+    World2ActionPipelineConfig,
+)
 from cosmos_predict2.configs.defaults.ema import EMAConfig
 from cosmos_predict2.models.text2image_dit import SACConfig
 from cosmos_predict2.models.world2action_dit import World2ActionDIT as VarNoiseWorld2ActionDIT
@@ -53,5 +58,9 @@ def register_pipe() -> None:
                 scheduler=SchedulerConfig(alpha=1.0, beta=1.0, num_denoising_steps=10),
                 net=net,
                 ema=EMAConfig(enabled=False),
+                # VLSP defaults; all scalar sub-fields are overridable from the
+                # experiment / CLI exactly like scheduler.num_denoising_steps.
+                action_source_prior=ActionSourcePriorConfig(),
+                action_conditioning=ActionConditioningConfig(),
             ),
         )

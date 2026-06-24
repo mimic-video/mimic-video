@@ -24,6 +24,7 @@ import torch.distributed as dist
 from einops import rearrange
 from megatron.core import parallel_state
 from omegaconf import DictConfig
+from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.nn import functional as F
@@ -33,6 +34,7 @@ from cosmos_predict2.conditioner import DataType
 from cosmos_predict2.configs.config_video2world import EMAConfig
 from cosmos_predict2.configs.config_world2action import World2ActionPipelineConfig
 from cosmos_predict2.data.action.utils import extract_normalization_types
+from cosmos_predict2.models.action_source_prior import COND_MODE_IDS, compute_prior_regularization
 from cosmos_predict2.pipelines.video2world import (
     Video2WorldPipeline,
     Video2WorldPipelineConfig,
@@ -140,6 +142,18 @@ class World2ActionModel(ImaginaireModel):
                 )
         else:
             self.pipe.denoising_model().requires_grad_(True)
+
+        # VLSP: the video-latent source prior is always fully trainable (even in
+        # LoRA mode); the video model stays frozen.  Match the trainable dtype of
+        # the action DiT so the optimizer param group is homogeneous: LoRA upcasts
+        # its trainable params to fp32, base training keeps them in self.precision.
+        if self.pipe.source_prior_has_params:
+            self.pipe.source_prior.requires_grad_(True)
+            self.pipe.source_prior.train()
+            if config.train_architecture == "lora":
+                for p in self.pipe.source_prior.parameters():
+                    p.data = p.data.to(torch.float32)
+
         total_params = sum(p.numel() for p in self.parameters())
         frozen_params = sum(p.numel() for p in self.parameters() if not p.requires_grad)
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -191,7 +205,13 @@ class World2ActionModel(ImaginaireModel):
             optimizer (torch.optim.Optimizer): The model optimizer.
             scheduler (torch.optim.lr_scheduler.LRScheduler): The optimization scheduler.
         """
-        optimizer: torch.optim.Optimizer = instantiate(optimizer_config, model=self.net)
+        # Include the VLSP source prior's parameters in the optimizer. The DiT
+        # keeps its base/LoRA trainability; the source prior is fully trainable.
+        if self.pipe.source_prior_has_params:
+            optim_module: nn.Module = nn.ModuleList([self.net, self.pipe.source_prior])
+        else:
+            optim_module = self.net
+        optimizer: torch.optim.Optimizer = instantiate(optimizer_config, model=optim_module)
         scheduler = get_base_scheduler(optimizer, self, scheduler_config)
         return optimizer, scheduler
 
@@ -211,6 +231,24 @@ class World2ActionModel(ImaginaireModel):
             # calculate beta for EMA update
             ema_beta = self.ema_beta(iteration)
             self.pipe.dit_ema_worker.update_average(self.net, self.net_ema, beta=ema_beta)
+            if self.pipe.source_prior_ema is not None:
+                self._update_source_prior_ema(ema_beta)
+
+    @torch.no_grad()
+    def _update_source_prior_ema(self, beta: float) -> None:
+        """Param-wise EMA for the VLSP source prior (weights = beta*ema + (1-beta)*new).
+
+        Implemented for the standard DDP / non-FSDP path. FSDP+EMA for the source
+        prior is not specially handled (the prior is small and left replicated);
+        see VLSP.md for the limitation.
+        """
+        src_params = dict(self.pipe.source_prior.named_parameters())
+        for name, p_ema in self.pipe.source_prior_ema.named_parameters():
+            p_ema.mul_(beta).add_(src_params[name].detach(), alpha=1.0 - beta)
+        src_buffers = dict(self.pipe.source_prior.named_buffers())
+        for name, b_ema in self.pipe.source_prior_ema.named_buffers():
+            if name in src_buffers:
+                b_ema.copy_(src_buffers[name])
 
     # New function, added for i4 adaption
     def on_train_start(self, memory_format: torch.memory_format, dataset_stats: dict, stats_id: str) -> None:
@@ -267,33 +305,42 @@ class World2ActionModel(ImaginaireModel):
 
         return t_B.unsqueeze(1).repeat(1, x0_size[1]).unsqueeze(2), epsilon
 
-    def compute_loss_with_epsilon_and_t(
+    def draw_training_t(self, x0_size: torch.Size) -> torch.Tensor:
+        """Draw the flow-matching timestep only.
+
+        The source endpoint is drawn separately via ``pipe.sample_action_source``;
+        with ``source_mode="gaussian"`` that draw matches the old epsilon exactly,
+        and drawing it *before* the timestep preserves the original RNG order.
+        """
+        t_B = self.pipe.scheduler.sample_t(x0_size[0])
+        return t_B.unsqueeze(1).repeat(1, x0_size[1]).unsqueeze(2)
+
+    def compute_loss(
         self,
         x0_B_HA_A: torch.Tensor,
-        epsilon_B_HA_A: torch.Tensor,
+        source_B_HA_A: torch.Tensor,
         t_B_HA_1: torch.Tensor,
         crossattn_emb: torch.Tensor,
         video_sigma_B_1: torch.Tensor,
         state_B_HO_O: torch.Tensor,
+        source_metrics: dict[str, torch.Tensor],
     ) -> tuple[dict, torch.Tensor]:
-        """
-        Compute loss given epsilon and t
+        """Flow-matching loss with a configurable source endpoint (VLSP).
 
-        It involves:
-        1. Adding noise to the input data.
-        2. Passing the noisy data through the network to generate predictions.
-        3. Computing the loss based on the difference between the predictions and the original data.
+        Interpolate between the (normalized) action ``x0`` and the source ``s``,
+        predict the flow field ``u_t = s - x0`` and regress it, optionally adding
+        a regularizer on the learned source prior:
 
-        Args:
-            data_batch (dict): raw data batch draw from the training data loader.
-            x0: image/video latent
-            crossattn_emb: video condition
-            epsilon: noise
-            t: noise level
+            x_t = (1 - t) * x0 + t * s
+            u_t = s - x0
+            L   = || v_theta(x_t, t, c) - u_t ||^2  +  L_prior
+
+        With ``source_mode="gaussian"`` (the default) ``s`` is N(0, I) and this is
+        identical to the original action flow loss.
         """
         # scale to have unit variance. don't know if this helps.
-        xt_B_HA_A = (1 - t_B_HA_1) * x0_B_HA_A + t_B_HA_1 * epsilon_B_HA_A
-        ut_B_HA_A = epsilon_B_HA_A - x0_B_HA_A
+        xt_B_HA_A = (1 - t_B_HA_1) * x0_B_HA_A + t_B_HA_1 * source_B_HA_A
+        ut_B_HA_A = source_B_HA_A - x0_B_HA_A
 
         vt_B_HA_A = self.pipe.denoise(
             xt_B_HA_A,
@@ -304,29 +351,50 @@ class World2ActionModel(ImaginaireModel):
             obs_dropout=0.2,
             return_hidden_states=False,
         ).float()
-        loss = F.mse_loss(vt_B_HA_A, ut_B_HA_A, reduction=self.loss_reduce) * self.loss_scale
+        loss_flow = F.mse_loss(vt_B_HA_A, ut_B_HA_A, reduction=self.loss_reduce) * self.loss_scale
+
+        # Optional regularizers on q_phi(s | video) (KL / mean-L2 / std). All
+        # weights default to 0.0, so loss_prior is a no-op for the baseline.
+        loss_prior, prior_logs = compute_prior_regularization(source_metrics, self.pipe.config.action_source_prior)
+        loss = loss_flow + loss_prior
 
         with torch.no_grad():
             var_inst_x0 = x0_B_HA_A.float().var(dim=(1, 2)).mean()
 
-            metrics = torch.stack(
-                [
-                    loss.float(),
-                    var_inst_x0,
-                ],
-                dim=0,
-            ).to(x0_B_HA_A.device)
-            metrics = _dp_mean(metrics)
-
-            if not dist.is_available() or not dist.is_initialized() or parallel_state.get_data_parallel_rank() == 0:
-                output_batch = {
-                    "loss": metrics[0].item(),
-                    "Var_inst[x_0]": metrics[1].item(),
-                }
+            if not self.pipe.source_prior_enabled:
+                # Exact baseline logging path (same keys / collective as before).
+                metrics = _dp_mean(torch.stack([loss.float(), var_inst_x0], dim=0).to(x0_B_HA_A.device))
+                if not dist.is_available() or not dist.is_initialized() or parallel_state.get_data_parallel_rank() == 0:
+                    output_batch = {"loss": metrics[0].item(), "Var_inst[x_0]": metrics[1].item()}
+                else:
+                    output_batch = {}
             else:
-                output_batch = {}
+                scalars: dict[str, torch.Tensor] = {
+                    "loss": loss.detach().float(),
+                    "loss/flow": loss_flow.detach().float(),
+                    "Var_inst[x_0]": var_inst_x0,
+                }
+                if torch.is_tensor(loss_prior):
+                    scalars["loss/source_prior"] = loss_prior.detach().float()
+                scalars.update(prior_logs)
+                for key, val in source_metrics.items():
+                    if key in ("mu", "logstd"):
+                        continue  # tensors used for regularization only
+                    scalars[key] = val
+                cond_mode = self.pipe.config.action_conditioning.mode
+                scalars["condition/mode_id"] = torch.as_tensor(
+                    float(COND_MODE_IDS.get(cond_mode, -1)), device=loss.device
+                )
+                scalars["condition/shuffle_enabled"] = torch.as_tensor(
+                    1.0 if cond_mode == "shuffled_video" else 0.0, device=loss.device
+                )
+                reduced = _dp_mean_dict(scalars, device=x0_B_HA_A.device)
+                if not dist.is_available() or not dist.is_initialized() or parallel_state.get_data_parallel_rank() == 0:
+                    output_batch = reduced
+                else:
+                    output_batch = {}
 
-        del var_inst_x0  # , var_batch_x0, var_eps, var_xt, var_ut, var_vt
+        del var_inst_x0
         gc.collect(0)
 
         return output_batch, loss
@@ -403,15 +471,37 @@ class World2ActionModel(ImaginaireModel):
 
         state_B_HO_O = normalised_data_batch["obs/lowdim_concat"]
 
-        t_B_HA_1, epsilon_B_HA_A = self.draw_training_t_and_epsilon(x0_B_HA_A.size())
+        language_B_L_D = (
+            data_batch.get("obs/language_embedding")
+            if self.pipe.config.action_source_prior.use_language
+            else None
+        )
 
-        output_batch, loss = self.compute_loss_with_epsilon_and_t(
+        # VLSP: draw the flow source first (gaussian == the old epsilon draw),
+        # then the timestep -> identical RNG order to the original baseline.
+        source_B_HA_A, source_metrics = self.pipe.sample_action_source(
+            x0_shape=x0_B_HA_A.size(),
+            crossattn_emb=crossattn_emb,
+            state_B_HO_O=state_B_HO_O,
+            context_timesteps_B_1=video_sigma_B_1,
+            x0_B_HA_A=x0_B_HA_A,
+            language_B_L_D=language_B_L_D,
+            training=True,
+        )
+        t_B_HA_1 = self.draw_training_t(x0_B_HA_A.size())
+
+        # VLSP: optionally zero / shuffle / drop the video condition fed to the
+        # action DiT (independent of the source prior input above).
+        crossattn_for_action = self.pipe.prepare_action_condition(crossattn_emb, training=True)
+
+        output_batch, loss = self.compute_loss(
             x0_B_HA_A,
-            epsilon_B_HA_A,
+            source_B_HA_A,
             t_B_HA_1,
-            crossattn_emb,
+            crossattn_for_action,
             video_sigma_B_1,
             state_B_HO_O,
+            source_metrics,
         )
 
         return output_batch, loss
@@ -505,6 +595,14 @@ class World2ActionModel(ImaginaireModel):
             ema_state_dict = self.pipe.dit_ema.state_dict(prefix="net_ema.")
             net_state_dict.update(ema_state_dict)
 
+        # VLSP: persist the source prior (and its EMA) alongside the DiT weights.
+        # Keys are prefixed so they round-trip through load_state_dict below and
+        # do not collide with the action/ema DiT keys.
+        if self.pipe.source_prior_has_params:
+            net_state_dict.update(self.pipe.source_prior.state_dict(prefix="source_prior."))
+            if self.config.pipe_config.ema.enabled and self.pipe.source_prior_ema is not None:
+                net_state_dict.update(self.pipe.source_prior_ema.state_dict(prefix="source_prior_ema."))
+
         # convert DTensor to Tensor
         for key, val in net_state_dict.items():
             if isinstance(val, DTensor):
@@ -531,11 +629,37 @@ class World2ActionModel(ImaginaireModel):
         """
         _reg_state_dict = collections.OrderedDict()
         _ema_state_dict = collections.OrderedDict()
+        _sp_state_dict = collections.OrderedDict()
+        _sp_ema_state_dict = collections.OrderedDict()
         for k, v in state_dict.items():
             if k.startswith("net."):
                 _reg_state_dict[k.replace("net.", "")] = v
             elif k.startswith("net_ema."):
                 _ema_state_dict[k.replace("net_ema.", "")] = v
+            elif k.startswith("source_prior_ema."):
+                _sp_ema_state_dict[k[len("source_prior_ema.") :]] = v
+            elif k.startswith("source_prior."):
+                _sp_state_dict[k[len("source_prior.") :]] = v
+
+        # VLSP: load the source prior non-strictly so that (a) old checkpoints with
+        # no source-prior keys load fine (the freshly-initialized prior is kept),
+        # and (b) an old action-decoder checkpoint can seed a brand-new source
+        # prior under mode != "gaussian".
+        if self.pipe.source_prior_has_params:
+            if len(_sp_state_dict) > 0:
+                sp_res = self.pipe.source_prior.load_state_dict(_sp_state_dict, strict=False)
+                log.info(
+                    f"Loaded source_prior: missing={len(sp_res.missing_keys)}, "
+                    f"unexpected={len(sp_res.unexpected_keys)}"
+                )
+            else:
+                log.warning("No source_prior.* weights in checkpoint; using freshly initialized source prior.")
+            if (
+                self.config.pipe_config.ema.enabled
+                and self.pipe.source_prior_ema is not None
+                and len(_sp_ema_state_dict) > 0
+            ):
+                self.pipe.source_prior_ema.load_state_dict(_sp_ema_state_dict, strict=False)
 
         state_dict = _reg_state_dict
 
@@ -589,8 +713,11 @@ class World2ActionModel(ImaginaireModel):
         error_if_nonfinite: bool = False,
         foreach: bool | None = None,
     ) -> torch.Tensor:
+        params = list(self.net.parameters())
+        if self.pipe.source_prior_has_params:
+            params = params + list(self.pipe.source_prior.parameters())
         return clip_grad_norm_(
-            self.net.parameters(),
+            params,
             max_norm,
             norm_type=norm_type,
             error_if_nonfinite=error_if_nonfinite,

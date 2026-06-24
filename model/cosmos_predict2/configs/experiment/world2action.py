@@ -79,6 +79,11 @@ def get_local_batch_size(global_bsz: int) -> int:
     return int(res)
 
 
+# A representative base experiment used as the foundation for the VLSP variants
+# below. The VLSP variants simply layer source-prior / action-conditioning
+# overrides on top of a concrete (video_ckpt, data_config, pipe, lr, bsz) base.
+vlsp_base_cfg: dict | None = None
+
 for video_ckpt, data_config, xattn_layer_idx, lr, bsz in it.product(
     VIDEO_MODEL_CKPT_NAMES, DATA_CONFIGS.keys(), xattn_layer_idxs, lrs, bszs
 ):
@@ -111,5 +116,75 @@ for video_ckpt, data_config, xattn_layer_idx, lr, bsz in it.product(
         name=exp_name,
         node=cfg,
     )
+
+    # Prefer a libero base for the VLSP variants (cheap to smoke-test); otherwise
+    # fall back to the first valid combination.
+    if vlsp_base_cfg is None or ("libero" in data_config and "libero" not in vlsp_base_cfg["job"]["name"]):
+        vlsp_base_cfg = copy.deepcopy(cfg)
+
+
+# --------------------------------------------------------------------------- #
+#  VLSP experiment variants                                                    #
+#                                                                              #
+#  source prior input  <-- action_source_prior.*                              #
+#  action DiT condition <-- action_conditioning.*  (independent axis)         #
+#                                                                              #
+#  Every variant below is registered on top of `vlsp_base_cfg`. To apply VLSP  #
+#  to a *different* base experiment, just add the same                         #
+#  `model.config.pipe_config.action_source_prior.*` /                          #
+#  `model.config.pipe_config.action_conditioning.*` overrides on the CLI       #
+#  (see VLSP.md).                                                              #
+# --------------------------------------------------------------------------- #
+def _vlsp_variant(*, mode: str, conditioning: str = "normal", enabled: bool | None = None, **prior_kwargs) -> dict:
+    """Build the pipe_config overrides for one VLSP variant."""
+    if enabled is None:
+        # gaussian is the only mode that is meaningful with VLSP disabled.
+        enabled = mode != "gaussian"
+    action_source_prior: dict = {"enabled": enabled, "mode": mode}
+    action_source_prior.update(prior_kwargs)
+    return {
+        "action_source_prior": action_source_prior,
+        "action_conditioning": {"mode": conditioning},
+    }
+
+
+VLSP_VARIANTS: dict[str, dict] = {
+    # A. baseline (exact original behaviour)
+    "vlsp_baseline_gaussian": _vlsp_variant(mode="gaussian", conditioning="normal", enabled=False),
+    "baseline_gaussian": _vlsp_variant(mode="gaussian", conditioning="normal", enabled=False),
+    # B/C. stochastic video-prior source
+    "vlsp_source_only_sample": _vlsp_variant(mode="video_prior_sample", conditioning="zero_video"),
+    "vlsp_source_condition_sample": _vlsp_variant(mode="video_prior_sample", conditioning="normal"),
+    # D/E. deterministic video-prior source
+    "vlsp_source_only_mean": _vlsp_variant(mode="video_prior_mean", conditioning="zero_video"),
+    "vlsp_source_condition_mean": _vlsp_variant(mode="video_prior_mean", conditioning="normal"),
+    # H. blend video source with Gaussian
+    "vlsp_blend_alpha_025": _vlsp_variant(mode="video_prior_blend", blend_alpha=0.25),
+    "vlsp_blend_alpha_050": _vlsp_variant(mode="video_prior_blend", blend_alpha=0.50),
+    "vlsp_blend_alpha_075": _vlsp_variant(mode="video_prior_blend", blend_alpha=0.75),
+    # F/G. negative controls
+    "vlsp_shuffled_source": _vlsp_variant(mode="shuffled_video_prior", conditioning="normal"),
+    "vlsp_shuffled_condition": _vlsp_variant(mode="video_prior_sample", conditioning="shuffled_video"),
+    # J. source dropout / mixture with Gaussian
+    "vlsp_dropout_020": _vlsp_variant(mode="video_prior_dropout", source_dropout_prob=0.20),
+    # I. residual source
+    "vlsp_residual": _vlsp_variant(mode="video_prior_residual", residual_scale=1.0),
+    # debug-only smoke mode
+    "vlsp_debug_gt_action_noisy": _vlsp_variant(mode="gt_action_noisy_debug", debug_noise_std=0.05),
+}
+
+if vlsp_base_cfg is not None:
+    for vlsp_name, overrides in VLSP_VARIANTS.items():
+        vlsp_cfg = copy.deepcopy(vlsp_base_cfg)
+        vlsp_cfg["job"]["group"] = "vlsp"
+        vlsp_cfg["job"]["name"] = vlsp_name
+        vlsp_cfg["model"]["config"]["pipe_config"]["action_source_prior"] = overrides["action_source_prior"]
+        vlsp_cfg["model"]["config"]["pipe_config"]["action_conditioning"] = overrides["action_conditioning"]
+        cs.store(
+            group="experiment",
+            package="_global_",
+            name=vlsp_name,
+            node=vlsp_cfg,
+        )
 
 # TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=7200 CUDA_DEVICE_MAX_CONNECTIONS=1 NVTE_FUSED_ATTN=0 torchrun --nproc_per_node=4 --master_port=12341 -m scripts.train --config=cosmos_predict2/configs/config.py -- experiment=...

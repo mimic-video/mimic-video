@@ -113,6 +113,12 @@ def get_args():
     parser.add_argument("--vam-lowdim-horizon", type=int, required=True)
     parser.add_argument("--vam-stop-video-denoising-step", type=int, required=True)
     parser.add_argument("--vam-num-execute-actions", type=int, required=True)
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        help="Device for the VAM policy: 'cuda', 'xpu' or 'cpu' (optionally with an index, e.g. 'xpu:0').",
+    )
 
     args = parser.parse_args()
 

@@ -45,7 +45,8 @@ def set_seed_everywhere(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -57,6 +58,7 @@ def load_video2world2action_pipeline(
     action_model_path: str,
     dataset_statistics_path: pathlib.Path,
     dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
 ) -> Video2World2ActionPipeline:
     """Instantiate the video-to-world-to-action pipeline and load normalizer statistics."""
     config = make_config()
@@ -68,7 +70,7 @@ def load_video2world2action_pipeline(
     video2world_pipe = Video2WorldPipeline.from_config(
         config=config.model.config.video_pipe_config,
         dit_path=video_model_path,
-        device="cuda",
+        device=device,
         torch_dtype=dtype,
         load_ema_to_reg=False,
     )
@@ -76,7 +78,7 @@ def load_video2world2action_pipeline(
     world2action_pipe = World2ActionPipeline.from_config(
         config.model.config.pipe_config,
         dit_path=action_model_path,
-        device="cuda",
+        device=device,
         dtype=dtype,
     )
 
@@ -88,11 +90,11 @@ def load_video2world2action_pipeline(
         stats,
         normalization_types=extract_normalization_types(data_config.policy_io.policy_io),
         concat_groups=data_config.policy_io.concat_groups,
-        device="cuda",
+        device=device,
         dtype=dtype,
     )
 
-    return Video2World2ActionPipeline(video2world_pipe, world2action_pipe).cuda()
+    return Video2World2ActionPipeline(video2world_pipe, world2action_pipe).to(device)
 
 
 class VAMInference:
@@ -109,12 +111,15 @@ class VAMInference:
         stop_video_denoising_step: int,
         num_execute_actions: int,
         rollout_dir: pathlib.Path,
+        device: str = "cuda",
     ):
+        self.device = device
         self.model = load_video2world2action_pipeline(
             experiment_name,
             video_model_path,
             action_model_path,
             dataset_statistics_path,
+            device=device,
         )
         self._image_horizon = img_horizon
         self._lowdim_horizon = lowdim_horizon
@@ -167,8 +172,8 @@ class VAMInference:
         images = np.concatenate(list(self._image_history)[::4], axis=1)  # downsample from 20 fps to 5
         lowdims = np.stack(list(self._lowdim_history), axis=0)
 
-        input_vid = torch.from_numpy(images[None]).cuda().to(dtype=torch.bfloat16)
-        state_tensor = torch.from_numpy(lowdims[None]).cuda().to(dtype=torch.bfloat16)
+        input_vid = torch.from_numpy(images[None]).to(device=self.device, dtype=torch.bfloat16)
+        state_tensor = torch.from_numpy(lowdims[None]).to(device=self.device, dtype=torch.bfloat16)
 
         with torch.no_grad():
             pred_actions = self.model(
@@ -313,6 +318,7 @@ def eval_vam_libero(
     eval_world_size: int = 1,
     num_steps_wait: int = 10,
     seed: int = 0,
+    device: str = "cuda",
 ) -> None:
     set_seed_everywhere(seed)
 
@@ -332,6 +338,7 @@ def eval_vam_libero(
         vam_stop_video_denoising_step,
         vam_num_execute_actions,
         rollout_dir,
+        device=device,
     )
 
     benchmark_dict = benchmark.get_benchmark_dict()

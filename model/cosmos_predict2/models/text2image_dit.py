@@ -22,7 +22,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import transformer_engine as te
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch import nn
@@ -37,13 +36,15 @@ from torch.utils.checkpoint import (
     create_selective_checkpoint_contexts,
 )
 from torchvision import transforms
-from transformer_engine.pytorch.attention import (
-    DotProductAttention,
-    apply_rotary_pos_emb,
-)
 
 from cosmos_predict2.conditioner import DataType
 from cosmos_predict2.module.a2a_cp import MinimalA2AAttnOp
+from cosmos_predict2.module.te_compat import (
+    DotProductAttention,
+    apply_rotary_pos_emb,
+    resolve_atten_backend,
+)
+from cosmos_predict2.module.te_compat import RMSNorm as TransformerEngineRMSNorm
 from cosmos_predict2.networks.model_weights_stats import WeightTrainingStat
 from cosmos_predict2.networks.selective_activation_checkpoint import (
     SACConfig as _SACConfig,
@@ -51,6 +52,7 @@ from cosmos_predict2.networks.selective_activation_checkpoint import (
 from cosmos_predict2.utils.context_parallel import split_inputs_cp
 from imaginaire.auxiliary.text_encoder import CosmosTextEncoderConfig
 from imaginaire.utils import log
+from imaginaire.utils.accelerator import cuda_graphs_supported
 from imaginaire.utils.graph import create_cuda_graph
 
 
@@ -296,16 +298,19 @@ class Attention(nn.Module):
         self.context_dim = context_dim
 
         self.q_proj = nn.Linear(query_dim, inner_dim, bias=False)
-        self.q_norm = te.pytorch.RMSNorm(self.head_dim, eps=1e-6)
+        self.q_norm = TransformerEngineRMSNorm(self.head_dim, eps=1e-6)
 
         self.k_proj = nn.Linear(context_dim, inner_dim, bias=False)
-        self.k_norm = te.pytorch.RMSNorm(self.head_dim, eps=1e-6)
+        self.k_norm = TransformerEngineRMSNorm(self.head_dim, eps=1e-6)
 
         self.v_proj = nn.Linear(context_dim, inner_dim, bias=False)
         self.v_norm = nn.Identity()
 
         self.output_proj = nn.Linear(inner_dim, query_dim, bias=False)
         self.output_dropout = nn.Dropout(dropout) if dropout > 1e-4 else nn.Identity()
+
+        # CUDA-only backends transparently fall back to portable PyTorch SDPA on XPU/CPU.
+        self.backend = resolve_atten_backend(self.backend)
 
         if self.backend == "transformer_engine":
             self.attn_op = DotProductAttention(
@@ -1291,7 +1296,7 @@ class MiniTrainDIT(WeightTrainingStat):
         else:
             self.crossattn_proj = None
 
-        self.t_embedding_norm = te.pytorch.RMSNorm(model_channels, eps=1e-6)
+        self.t_embedding_norm = TransformerEngineRMSNorm(model_channels, eps=1e-6)
         self.init_weights()
         self.enable_selective_checkpoint(sac_config)
         self._is_context_parallel_enabled = False
@@ -1452,6 +1457,9 @@ class MiniTrainDIT(WeightTrainingStat):
             f"Expected DataType, got {type(data_type)}. We need discuss this flag later."
         )
         assert not (self.training and use_cuda_graphs), "CUDA Graphs are supported only for inference"
+        if use_cuda_graphs and not cuda_graphs_supported(x_B_C_T_H_W.device):
+            log.warning("CUDA Graphs are only supported on CUDA; falling back to eager execution.")
+            use_cuda_graphs = False
         B, C, T, H, W = x_B_C_T_H_W.shape
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.prepare_embedded_sequence(
             x_B_C_T_H_W,

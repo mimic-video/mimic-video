@@ -22,6 +22,7 @@ if __name__ == "__main__":
         args.vam_stop_video_denoising_step,
         args.vam_num_execute_actions,
         is_hil=True,
+        device=args.device,
     )
     success_arr = maniskill2_hil_evaluator(model, args)
     print(args)

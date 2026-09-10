@@ -51,6 +51,7 @@ from imaginaire.auxiliary.text_encoder import (
 )
 from imaginaire.lazy_config import instantiate
 from imaginaire.utils import log, misc
+from imaginaire.utils.accelerator import empty_cache
 from imaginaire.utils.easy_io import easy_io
 from imaginaire.utils.ema import FastEmaModelUpdater
 
@@ -253,6 +254,9 @@ class Video2WorldPipeline(BasePipeline):
         self.height_division_factor = 16
         self.width_division_factor = 16
         self.use_unified_sequence_parallel = False
+        # Whether the text encoder should be temporarily moved to the pipeline device
+        # for each prompt (CPU offloading) rather than living there permanently.
+        self.text_encoder_offload = False
 
     @staticmethod
     def from_config(
@@ -262,6 +266,7 @@ class Video2WorldPipeline(BasePipeline):
         offload_text_encoder: bool = False,
         downcast_text_encoder: bool = False,
         device: str = "cuda",
+        text_encoder_device: str | None = None,
         torch_dtype: torch.dtype = torch.bfloat16,
         load_ema_to_reg: bool = False,
     ) -> Any:
@@ -273,7 +278,7 @@ class Video2WorldPipeline(BasePipeline):
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
         }[config.precision]
-        pipe.tensor_kwargs = {"device": "cuda", "dtype": pipe.precision}
+        pipe.tensor_kwargs = {"device": device, "dtype": pipe.precision}
         log.warning(f"precision {pipe.precision}")
 
         # 1. set data keys and data information
@@ -293,7 +298,7 @@ class Video2WorldPipeline(BasePipeline):
         )
 
         # 3. Set up tokenizer
-        pipe.tokenizer = instantiate(config.tokenizer)
+        pipe.tokenizer = instantiate(config.tokenizer, device=device, dtype=pipe.precision)
         assert pipe.tokenizer.latent_ch == pipe.config.state_ch, (
             f"latent_ch {pipe.tokenizer.latent_ch} != state_shape {pipe.config.state_ch}"
         )
@@ -301,11 +306,15 @@ class Video2WorldPipeline(BasePipeline):
 
         # 4. Load text encoder
         if use_text_encoder:
+            # The T5-11B encoder is large; it can live on a different device than the DiTs
+            # (e.g. a second accelerator) or on the CPU when offloading is requested.
+            resolved_text_encoder_device = text_encoder_device or ("cpu" if offload_text_encoder else device)
             pipe.text_encoder = CosmosT5TextEncoder(
                 config=config.text_encoder.t5,
-                device="cpu" if offload_text_encoder else device,
+                device=resolved_text_encoder_device,
                 torch_dtype=pipe.precision if downcast_text_encoder else None,
             )
+            pipe.text_encoder_offload = offload_text_encoder
         else:
             pipe.text_encoder = None
 
@@ -367,7 +376,7 @@ class Video2WorldPipeline(BasePipeline):
             pipe.dit_ema_worker.copy_to(src_model=pipe.dit, tgt_model=pipe.dit_ema)
 
         pipe.dit = pipe.dit.to(device=device, dtype=torch_dtype)
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
         # 7. training states
         if parallel_state.is_initialized():
@@ -442,10 +451,10 @@ class Video2WorldPipeline(BasePipeline):
         if negative_prompt:
             data_batch["neg_t5_text_embeddings"] = self.encode_prompt(negative_prompt).to(dtype=self.torch_dtype)
 
-        # Move tensors to GPU and convert to bfloat16 if they are floating point
+        # Move tensors to the appropriate accelerator and convert to the pipeline precision if floating point
         for k, v in data_batch.items():
             if isinstance(v, torch.Tensor) and torch.is_floating_point(data_batch[k]):
-                data_batch[k] = v.cuda().to(dtype=torch.bfloat16)
+                data_batch[k] = v.to(device=self.device, dtype=self.torch_dtype)
 
         return data_batch
 
@@ -455,17 +464,17 @@ class Video2WorldPipeline(BasePipeline):
     def encode_prompt(
         self, prompts: str | list[str], max_length: int | None = None, return_mask: bool = False
     ) -> torch.Tensor:
-        offload_to_host = any([p.device.type == "cpu" for p in self.text_encoder.parameters()])
+        offload_to_host = getattr(self, "text_encoder_offload", False)
 
         if offload_to_host:
-            self.text_encoder.to(device="cuda")
+            self.text_encoder.to(device=self.device)
 
         embeddings = self.text_encoder.encode_prompts(prompts, max_length=max_length, return_mask=return_mask)
 
         if offload_to_host:
             self.text_encoder.to(device="cpu")
             gc.collect()
-            torch.cuda.empty_cache()
+            empty_cache(self.device)
 
         return embeddings
 
@@ -544,7 +553,7 @@ class Video2WorldPipeline(BasePipeline):
         B, C, T, H, W = state.shape
 
         if T not in {1, 5, 61} or (C, H, W) != (3, 480, 640):
-            msg = "Unexpected raw images sequence length ({state.shape=})"
+            msg = f"Unexpected raw images sequence length ({state.shape=})"
             raise ValueError(msg)
 
         encoded = self.tokenizer.encode(state) * self.sigma_data

@@ -19,7 +19,6 @@ from collections.abc import Callable
 
 import einops
 import torch
-import transformer_engine as te
 from einops import rearrange
 from torch import nn
 from torch.distributed import ProcessGroup
@@ -28,16 +27,19 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
-from transformer_engine.pytorch.attention import (
+
+from cosmos_predict2.module.te_compat import (
     DotProductAttention,
     apply_rotary_pos_emb,
+    resolve_atten_backend,
 )
-
+from cosmos_predict2.module.te_compat import RMSNorm as TransformerEngineRMSNorm
 from cosmos_predict2.networks.selective_activation_checkpoint import (
     CheckpointMode,
     SACConfig,
 )
 from imaginaire.utils import log
+from imaginaire.utils.accelerator import cuda_graphs_supported
 from imaginaire.utils.graph import create_cuda_graph
 
 
@@ -166,19 +168,21 @@ def torch_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H
         v_B_S_H_D: Value tensor with shape (batch, seq_len, n_heads, head_dim)
 
     Returns:
-        Attention output tensor with shape (batch, seq_len, n_heads * head_dim)
+        Attention output tensor with shape (batch, seq_len, n_heads, head_dim), matching the layout
+        produced by the flash-attn / Transformer Engine backends so that ``compute_attention`` can
+        merge the head dimension uniformly.
     """
     in_q_shape = q_B_S_H_D.shape
     in_k_shape = k_B_S_H_D.shape
     q_B_H_S_D = rearrange(q_B_S_H_D, "b ... h k -> b h ... k").view(in_q_shape[0], in_q_shape[-2], -1, in_q_shape[-1])
     k_B_H_S_D = rearrange(k_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
     v_B_H_S_D = rearrange(v_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    result_B_S_HD = rearrange(
+    result_B_S_H_D = rearrange(
         torch.nn.functional.scaled_dot_product_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D),
-        "b h ... l -> b ... (h l)",
+        "b h ... l -> b ... h l",
     )
 
-    return result_B_S_HD
+    return result_B_S_H_D
 
 
 class Attention(nn.Module):
@@ -242,16 +246,19 @@ class Attention(nn.Module):
         self.context_dim = context_dim
 
         self.q_proj = nn.Linear(query_dim, inner_dim, bias=False)
-        self.q_norm = te.pytorch.RMSNorm(self.head_dim, eps=1e-6)
+        self.q_norm = TransformerEngineRMSNorm(self.head_dim, eps=1e-6)
 
         self.k_proj = nn.Linear(context_dim, inner_dim, bias=False)
-        self.k_norm = te.pytorch.RMSNorm(self.head_dim, eps=1e-6)
+        self.k_norm = TransformerEngineRMSNorm(self.head_dim, eps=1e-6)
 
         self.v_proj = nn.Linear(context_dim, inner_dim, bias=False)
         self.v_norm = nn.Identity()
 
         self.output_proj = nn.Linear(inner_dim, query_dim, bias=False)
         self.output_dropout = nn.Dropout(dropout) if dropout > 1e-4 else nn.Identity()
+
+        # CUDA-only backends transparently fall back to portable PyTorch SDPA on XPU/CPU.
+        self.backend = resolve_atten_backend(self.backend)
 
         if self.backend == "transformer_engine":
             self.attn_op = DotProductAttention(
@@ -363,7 +370,11 @@ class ContinuousSinusoidalPosEmb(nn.Module):
         fraction = torch.linspace(0.0, 1.0, self._num_channels // 2, device=timesteps_B_T.device, dtype=torch.float64)
         freqs = math.tau / (self._min_period * (self._max_period / self._min_period) ** fraction)
         sinusoid_input_B_T_D = einops.einsum(timesteps_B_T, freqs, "b i, j -> b i j")
-        return torch.cat((torch.sin(sinusoid_input_B_T_D), torch.cos(sinusoid_input_B_T_D)), dim=-1).bfloat16()
+        # Keep the caller's dtype (the consuming projection casts to its weight dtype) so
+        # the model can be run in float32 as well as the default bfloat16.
+        return torch.cat((torch.sin(sinusoid_input_B_T_D), torch.cos(sinusoid_input_B_T_D)), dim=-1).to(
+            timesteps_B_T.dtype
+        )
 
 
 class PairTimestepEmbedding(nn.Module):
@@ -420,6 +431,9 @@ class PairTimestepEmbedding(nn.Module):
         action_timestep_feats_B_T_D: torch.Tensor,
         video_timestep_feats_B_1_D: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # The sinusoidal features are produced in fp32; match the projection weights (bf16/fp32).
+        action_timestep_feats_B_T_D = action_timestep_feats_B_T_D.to(self.proj_x.weight.dtype)
+        video_timestep_feats_B_1_D = video_timestep_feats_B_1_D.to(self.proj_c.weight.dtype)
         video_timestep_feats_B_T_D = video_timestep_feats_B_1_D.expand_as(action_timestep_feats_B_T_D)
 
         emb_act_B_T_D = self.act(self.proj_x(action_timestep_feats_B_T_D))
@@ -828,7 +842,7 @@ class World2ActionDIT(nn.Module):
             adaln_lora_dim=self.adaln_lora_dim,
         )
 
-        self.t_embedding_norm = te.pytorch.RMSNorm(
+        self.t_embedding_norm = TransformerEngineRMSNorm(
             pair_timestep_feature_rank if use_adaln_lora else model_channels, eps=1e-6
         )
         self.init_weights()
@@ -887,6 +901,9 @@ class World2ActionDIT(nn.Module):
             crossattn_emb: (B, N, D) tensor of cross-attention embeddings
         """
         assert not (self.training and use_cuda_graphs), "CUDA Graphs are supported only for inference"
+        if use_cuda_graphs and not cuda_graphs_supported(state_B_HO_O.device):
+            log.warning("CUDA Graphs are only supported on CUDA; falling back to eager execution.")
+            use_cuda_graphs = False
         x_B_T_D = self.prepare_embedded_sequence(state_B_HO_O, xt_B_HA_A, obs_dropout=obs_dropout)
         crossattn_emb = self.ctx_norm(crossattn_emb)
 

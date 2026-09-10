@@ -29,6 +29,7 @@ def load_video2world2action_pipeline(
     action_model_path: str,
     dataset_statistics_path: pathlib.Path,
     is_hil: bool,
+    device: str = "cuda",
 ):
     config = make_config()
     config = override(config, ["--", f"experiment={experiment_name}"])
@@ -39,7 +40,7 @@ def load_video2world2action_pipeline(
     video2world_pipe = Video2WorldPipeline.from_config(
         config=config.model.config.video_pipe_config,
         dit_path=video_model_path,
-        device="cuda",
+        device=device,
         torch_dtype=torch.bfloat16,
         load_ema_to_reg=False,
     )
@@ -47,7 +48,7 @@ def load_video2world2action_pipeline(
     world2action_pipe = World2ActionPipeline.from_config(
         config.model.config.pipe_config,
         dit_path=action_model_path,
-        device="cuda",
+        device=device,
         dtype=torch.bfloat16,
     )
     data_config = instantiate(config.data_config)
@@ -59,13 +60,13 @@ def load_video2world2action_pipeline(
         stats,
         normalization_types=extract_normalization_types(data_config.policy_io.policy_io),
         concat_groups=data_config.policy_io.concat_groups,
-        device="cuda",
+        device=device,
         dtype=torch.bfloat16,
     )
     if is_hil:
-        return HILVideo2World2ActionPipeline(video2world_pipe, world2action_pipe).cuda()
+        return HILVideo2World2ActionPipeline(video2world_pipe, world2action_pipe).to(device)
 
-    return Video2World2ActionPipeline(video2world_pipe, world2action_pipe).cuda()
+    return Video2World2ActionPipeline(video2world_pipe, world2action_pipe).to(device)
 
 
 class VAMInference:
@@ -80,13 +81,16 @@ class VAMInference:
         stop_video_denoising_step: int,
         num_execute_actions: int,
         is_hil: bool,
+        device: str = "cuda",
     ):
+        self.device = device
         self.model = load_video2world2action_pipeline(
             experiment_name,
             video_model_path,
             action_model_path,
             dataset_statistics_path,
             is_hil,
+            device=device,
         )
 
         self._image_horizon = img_horizon
@@ -179,9 +183,9 @@ class VAMInference:
 
             if self.is_hil:
                 pred_actions = self.model(
-                    input_vid=torch.from_numpy(images[None]).cuda().bfloat16(),
-                    gt_future_vid=torch.from_numpy(self._future_vid[None]).cuda().bfloat16(),
-                    state_B_HO_O=torch.from_numpy(lowdims[None]).cuda().bfloat16(),
+                    input_vid=torch.from_numpy(images[None]).to(device=self.device, dtype=torch.bfloat16),
+                    gt_future_vid=torch.from_numpy(self._future_vid[None]).to(device=self.device, dtype=torch.bfloat16),
+                    state_B_HO_O=torch.from_numpy(lowdims[None]).to(device=self.device, dtype=torch.bfloat16),
                     prompt=task_description,
                     num_sampling_step=35,
                     stop_after_step=self.stop_video_denoising_step,
@@ -190,8 +194,8 @@ class VAMInference:
                 self._future_vid = None
             else:
                 pred_actions = self.model(
-                    input_vid=torch.from_numpy(images[None]).cuda().bfloat16(),
-                    state_B_HO_O=torch.from_numpy(lowdims[None]).cuda().bfloat16(),
+                    input_vid=torch.from_numpy(images[None]).to(device=self.device, dtype=torch.bfloat16),
+                    state_B_HO_O=torch.from_numpy(lowdims[None]).to(device=self.device, dtype=torch.bfloat16),
                     prompt=task_description,
                     num_sampling_step=35,
                     stop_after_step=self.stop_video_denoising_step,

@@ -69,6 +69,46 @@ except ModuleNotFoundError:
     FLASH_ATTN_3_AVAILABLE = False
 
 
+def _chunked_attention(
+    q_B_H_S_D: torch.Tensor,
+    k_B_H_S_D: torch.Tensor,
+    v_B_H_S_D: torch.Tensor,
+    causal: bool = False,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+    max_score_elems: int = 2**27,
+) -> torch.Tensor:
+    """Memory-bounded scaled dot-product attention.
+
+    Slices the query dimension so the ``[B, H, chunk, S]`` score matrix stays within
+    ``max_score_elems`` elements. Mathematically identical to
+    ``scaled_dot_product_attention``, but never materializes the full ``S x S`` matrix --
+    which is what the CPU/XPU MATH fallback would otherwise do for fp32.
+
+    Returns a tensor in the ``[B, S, H, D]`` layout (the caller's expectation).
+    """
+    batch, heads, q_len, head_dim = q_B_H_S_D.shape
+    k_len = k_B_H_S_D.shape[2]
+    scale = softmax_scale if softmax_scale is not None else head_dim**-0.5
+    max_score_elems = max(1, max_score_elems)
+    chunk = max(1, min(q_len, max_score_elems // max(1, batch * heads * k_len)))
+
+    outputs = []
+    for start in range(0, q_len, chunk):
+        q_chunk = q_B_H_S_D[:, :, start : start + chunk]
+        scores = torch.matmul(q_chunk, k_B_H_S_D.transpose(-2, -1)) * scale
+        if causal:
+            q_idx = torch.arange(start, start + q_chunk.shape[2], device=q_B_H_S_D.device).view(1, 1, -1, 1)
+            k_idx = torch.arange(k_len, device=q_B_H_S_D.device).view(1, 1, 1, -1)
+            scores = scores.masked_fill(k_idx > q_idx, float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        if dropout_p > 0.0:
+            probs = torch.nn.functional.dropout(probs, p=dropout_p, training=True)
+        outputs.append(torch.matmul(probs, v_B_H_S_D))
+    out = torch.cat(outputs, dim=2)
+    return out.transpose(1, 2).contiguous()
+
+
 def get_device_cc(device) -> int:
     """
     Returns the compute capability of a given torch device if it's a CUDA device, otherwise returns 0.
@@ -96,8 +136,13 @@ def attention(
     q_scale=None,
     causal=False,
     deterministic=False,
-    dtype=torch.bfloat16,
+    dtype=None,
 ):
+    if dtype is None:
+        # Preserve the historical bfloat16 default on CUDA so existing behaviour and
+        # numerics are untouched; off CUDA (XPU/CPU) follow the model dtype instead of
+        # forcing bf16, which lets the pipeline run in float32.
+        dtype = torch.bfloat16 if q.device.type == "cuda" else q.dtype
     supported_dtypes = [torch.bfloat16, torch.float16, torch.float32]
     is_half = dtype in [torch.bfloat16, torch.float16]
     compute_cap = get_device_cc(q.device)
@@ -111,6 +156,27 @@ def attention(
 
     if q_scale is not None:
         q = q * q_scale
+
+    if q.device.type != "cuda":
+        # Intel XPU / CPU: the SDPA backends selected below (flash-attn, cuDNN, memory-efficient)
+        # are CUDA-only. Rely on PyTorch's default backend selection for the device instead.
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        if dtype == torch.float32:
+            # On XPU the only fp32 SDPA backend is MATH, which materializes the full S x S
+            # score matrix (tens of GB for the video DiT). Use a memory-bounded, chunked
+            # attention instead; the algorithm is identical on CPU and XPU.
+            return _chunked_attention(q, k, v, causal=causal, dropout_p=dropout_p, softmax_scale=softmax_scale)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=causal,
+            dropout_p=dropout_p,
+            scale=softmax_scale,
+        )
+        return out.transpose(1, 2).contiguous()
 
     # If Flash Attention 3 is installed, and the user's running on a Hopper GPU (compute capability
     # 9.0, or SM90), use Flash Attention 3.

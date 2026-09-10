@@ -14,7 +14,14 @@
 # limitations under the License.
 
 import torch
-from apex.multi_tensor_apply import multi_tensor_applier
+
+try:  # apex ships CUDA extensions only; it is a training dependency, not needed for inference.
+    from apex.multi_tensor_apply import multi_tensor_applier
+
+    APEX_AVAILABLE = True
+except ImportError:  # pragma: no cover - XPU / CPU / CUDA without apex
+    multi_tensor_applier = None
+    APEX_AVAILABLE = False
 
 from imaginaire.utils import distributed, log
 from imaginaire.utils.misc import get_local_tensor_if_DTensor
@@ -123,7 +130,7 @@ class FusedAdam(torch.optim.Optimizer):
 
             self._step_supports_amp_scaling = True
 
-        if multi_tensor_applier.available:
+        if APEX_AVAILABLE and multi_tensor_applier.available:
             import amp_C
 
             # Skip buffer

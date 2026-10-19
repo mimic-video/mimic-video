@@ -34,6 +34,7 @@ from cosmos_predict2.configs.config_video2world import (
 )
 from cosmos_predict2.pipelines.video2world import _IMAGE_EXTENSIONS, _VIDEO_EXTENSIONS, Video2WorldPipeline
 from imaginaire.utils import distributed, log, misc
+from imaginaire.utils.accelerator import resolve_device, synchronize
 from imaginaire.utils.io import save_image_or_video
 
 _DEFAULT_NEGATIVE_PROMPT = "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, underexposed and overexposed scenes, poor color balance, washed out colors, choppy sequences, jerky movements, low frame rate, artifacting, color banding, unnatural transitions, outdated special effects, fake elements, unconvincing visuals, poorly edited content, jump cuts, visual noise, and flickering. Overall, the video is of poor quality."
@@ -112,6 +113,9 @@ def parse_args() -> argparse.Namespace:
         help="Path to JSON file containing batch inputs. Each entry should have 'input_video', 'prompt', and 'output_video' fields.",
     )
     parser.add_argument("--guidance", type=float, default=7, help="Guidance value")
+    parser.add_argument(
+        "--num_sampling_step", type=int, default=35, help="Number of denoising steps to run (default: 35)."
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
     parser.add_argument(
         "--save_path",
@@ -120,15 +124,46 @@ def parse_args() -> argparse.Namespace:
         help="Path to save the generated video (include file extension)",
     )
     parser.add_argument(
+        "--save_raw_npy",
+        type=str,
+        default=None,
+        help="Optionally also save the raw output tensor as a .npy file (exact, for device parity checks).",
+    )
+    parser.add_argument(
         "--num_gpus",
         type=int,
         default=1,
         help="Number of GPUs to use for context parallel inference (should be a divisor of the total frames)",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help=(
+            "Device to run inference on: 'cuda', 'xpu', or 'cpu' (optionally with an index, e.g. 'xpu:0'). "
+            "Defaults to the best available accelerator (cuda > xpu > cpu)."
+        ),
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bfloat16",
+        choices=["bfloat16", "float32"],
+        help="Compute precision. bfloat16 is the native training precision; float32 is useful for strict parity checks.",
+    )
     parser.add_argument("--disable_guardrail", action="store_true", help="Disable guardrail checks on prompts")
     parser.add_argument("--offload_guardrail", action="store_true", help="Offload guardrail to CPU to save GPU memory")
     parser.add_argument(
         "--offload_text_encoder", action="store_true", help="Offload text encoder to CPU to save GPU memory"
+    )
+    parser.add_argument(
+        "--text_encoder_device",
+        type=str,
+        default=None,
+        help=(
+            "Device for the T5 text encoder (defaults to --device). Use e.g. 'cpu' to keep the 11B encoder "
+            "off the accelerator, or a second accelerator such as 'xpu:1'."
+        ),
     )
     parser.add_argument(
         "--downcast_text_encoder",
@@ -147,20 +182,30 @@ def parse_args() -> argparse.Namespace:
 def setup_pipeline(args: argparse.Namespace, text_encoder: CosmosTextEncoder | None = None):
     print_environment_info(args)
 
+    device = resolve_device(args.device)
+    log.info(f"Running inference on device: {device}")
+
     config = get_cosmos_predict2_video2world_pipeline(model_size="2B", resolution="480", fps=10)
+    config.precision = args.dtype
+    torch_dtype = torch.float32 if args.dtype == "float32" else torch.bfloat16
     dit_path = args.dit_path
     log.info(f"Using dit_path: {dit_path}")
 
     misc.set_random_seed(seed=args.seed, by_rank=True)
-    # Initialize cuDNN.
+    # Initialize cuDNN (CUDA-only; the flags are harmless no-ops on other backends).
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
     # Floating-point precision settings.
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cuda.matmul.allow_tf32 = True
+    if device.startswith("cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = True
 
     # Initialize distributed environment for multi-GPU inference
     if hasattr(args, "num_gpus") and args.num_gpus > 1:
+        if not device.startswith("cuda"):
+            raise ValueError(
+                f"Multi-device context parallel inference (--num_gpus > 1) is only supported on CUDA, got {device}."
+            )
         log.info(f"Initializing distributed environment with {args.num_gpus} GPUs for context parallelism")
 
         # Check if distributed environment is already initialized
@@ -199,8 +244,9 @@ def setup_pipeline(args: argparse.Namespace, text_encoder: CosmosTextEncoder | N
         use_text_encoder=text_encoder is None,
         offload_text_encoder=args.offload_text_encoder,
         downcast_text_encoder=args.downcast_text_encoder,
-        device="cuda",
-        torch_dtype=torch.bfloat16,
+        device=device,
+        text_encoder_device=resolve_device(args.text_encoder_device) if args.text_encoder_device else None,
+        torch_dtype=torch_dtype,
         load_ema_to_reg=args.load_ema,
     )
 
@@ -221,6 +267,8 @@ def process_single_generation(
     num_conditional_frames: int,
     guidance: float,
     seed: int,
+    num_sampling_step: int = 35,
+    save_raw_npy: str | None = None,
     benchmark: bool = False,
     use_cuda_graphs: bool = False,
 ) -> bool:
@@ -235,7 +283,7 @@ def process_single_generation(
     time_sum = 0
     for i in range(num_repeats):
         if benchmark and i > 0:
-            torch.cuda.synchronize()
+            synchronize(pipe.device)
             start_time = time.time()
         video = pipe(
             prompt=prompt,
@@ -244,11 +292,12 @@ def process_single_generation(
             input_path=input_path,
             num_conditional_frames=num_conditional_frames,
             guidance=guidance,
+            num_sampling_step=num_sampling_step,
             seed=seed,
             use_cuda_graphs=use_cuda_graphs,
         )
         if benchmark and i > 0:
-            torch.cuda.synchronize()
+            synchronize(pipe.device)
             elapsed = time.time() - start_time
             time_sum += elapsed
             log.info(f"[iter {i} / {num_repeats - 1}] Generation time: {elapsed:.1f} seconds.")
@@ -268,6 +317,13 @@ def process_single_generation(
             fps = 16
         save_image_or_video(video, output_path, fps=fps)
         log.success(f"Successfully saved video to: {output_path}")
+
+        if save_raw_npy is not None:
+            import numpy as np
+
+            raw = video.float().cpu().numpy() if isinstance(video, torch.Tensor) else video
+            np.save(save_raw_npy, raw)
+            log.success(f"Saved raw output tensor {raw.shape} to: {save_raw_npy}")
 
         return True
     return False
@@ -305,6 +361,8 @@ def generate_video(args: argparse.Namespace, pipe: Video2WorldPipeline) -> None:
                 num_conditional_frames=args.num_conditional_frames,
                 guidance=args.guidance,
                 seed=args.seed,
+                num_sampling_step=args.num_sampling_step,
+                save_raw_npy=args.save_raw_npy,
                 benchmark=args.benchmark,
                 use_cuda_graphs=args.use_cuda_graphs,
             )
@@ -319,6 +377,8 @@ def generate_video(args: argparse.Namespace, pipe: Video2WorldPipeline) -> None:
             num_conditional_frames=args.num_conditional_frames,
             guidance=args.guidance,
             seed=args.seed,
+            num_sampling_step=args.num_sampling_step,
+            save_raw_npy=args.save_raw_npy,
             benchmark=args.benchmark,
             use_cuda_graphs=args.use_cuda_graphs,
         )

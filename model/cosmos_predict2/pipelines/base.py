@@ -18,6 +18,8 @@ import torch
 from PIL import Image
 from torchvision.transforms import GaussianBlur
 
+from imaginaire.utils.accelerator import empty_cache
+
 
 class BasePipeline(torch.nn.Module):
     def __init__(
@@ -140,8 +142,8 @@ class BasePipeline(torch.nn.Module):
                             module.onload()
                 else:
                     model.to(self.device)
-        # fresh the cuda cache
-        torch.cuda.empty_cache()
+        # free the accelerator cache (CUDA/XPU; no-op on CPU)
+        empty_cache(self.device)
 
     def generate_noise(self, shape, seed=None, device="cpu", dtype=torch.float16):
         generator = None if seed is None else torch.Generator(device).manual_seed(seed)

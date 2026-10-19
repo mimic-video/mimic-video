@@ -52,6 +52,63 @@ python scripts/download_checkpoints.py
 ```
 If you want to run guardrails (default enabled), additionally request access to and download `nvidia/Cosmos-Guardrail1` and `meta-llama/Llama-Guard-3-8B` to the checkpoints directory.
 
+## Intel XPU Support
+
+Inference can run on Intel XPU (as well as CUDA and CPU). All inference entry points accept a `--device` flag
+(`cuda`, `xpu` or `cpu`, optionally with an index such as `xpu:1`) and default to the best available accelerator.
+
+### Setup
+
+Use the PyTorch XPU build (`torch`, `torchvision`, `torchaudio` from the Intel XPU wheel index) and install the
+remaining dependencies without the CUDA extras:
+
+```bash
+cd model
+python -m venv --system-site-packages .venv   # reuse the system torch+xpu
+source .venv/bin/activate
+pip install attrs loguru einops termcolor pyyaml "hydra-core==1.3.2" omegaconf mediapy "imageio[pyav,ffmpeg]" \
+    iopath "megatron-core==0.12.1" "diffusers==0.33.1" ftfy scikit-image pandas opencv-python-headless \
+    peft protobuf tyro webdataset boto3 h11 fvcore nltk threadpoolctl better-profanity decord2
+```
+
+Transformer Engine, flash-attn and apex are CUDA-only. They are now optional: when they are missing the DiTs
+transparently fall back to PyTorch SDPA attention, and fused optimizers raise a clear error only if actually used.
+
+### Running
+
+```bash
+# Text/image -> video generation
+python scripts/run_video2world.py --device xpu --disable_guardrail \
+    --prompt "a robot arm picks up a carrot" --input_path /path/to/frame.png --save_path out.mp4
+
+# VAM policy (LIBERO / SIMPLER). The policy path is device-agnostic; the simulators still require their own setup.
+python eval/libero/run.py --device xpu ...
+```
+
+The 11B T5 text encoder is ~45 GB in fp32 and does not fit next to the Cosmos models on a single 24 GB card.
+Use `--text_encoder_device` to place it elsewhere (e.g. `--text_encoder_device cpu` or `--text_encoder_device xpu:1`),
+optionally combined with `--downcast_text_encoder`.
+
+### Simulator-free parity testing
+
+`scripts/vam_inference.py` runs the full `Video2World2ActionPipeline` on a deterministic synthetic observation and
+writes the predicted action chunk to `.npy`, which makes it easy to compare devices:
+
+```bash
+python scripts/vam_inference.py --device cpu --output /tmp/vam_cpu.npy
+python scripts/vam_inference.py --device xpu --output /tmp/vam_xpu.npy
+python scripts/compare_outputs.py /tmp/vam_cpu.npy /tmp/vam_xpu.npy --atol 1e-3
+```
+
+Notes on precision and parity:
+
+* `bfloat16` (the native training precision) is quantized with 8 mantissa bits: one ULP is already
+  `3.9e-3` for values in `[0.5, 1)`, so an absolute tolerance of `1e-3` is not meaningful there.
+  Native bf16 CPU-vs-XPU runs agree to within a few ULP (measured max abs diff `6.0e-3`).
+* For a strict parity check run both devices with `--dtype float32`. XPU has no fused fp32 SDPA kernel, so the
+  non-CUDA attention path uses a memory-bounded chunked attention; measured CPU-vs-XPU agreement is then
+  max abs diff `3.5e-6` for the action decoder and `~1e-3` on the generated video tensor.
+
 ## Training
 
 You can find an overview over the training repository (which is built on the [Cosmos-Predict2](https://github.com/nvidia-cosmos/cosmos-predict2) repo) in [MODEL.md](./MODEL.md). A quickstart to training your own models is given below.

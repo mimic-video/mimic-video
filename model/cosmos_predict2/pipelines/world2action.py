@@ -34,6 +34,7 @@ from cosmos_predict2.utils.dtensor_helper import (
 )
 from imaginaire.lazy_config import instantiate
 from imaginaire.utils import log, misc
+from imaginaire.utils.accelerator import empty_cache
 from imaginaire.utils.ema import FastEmaModelUpdater
 
 
@@ -67,7 +68,7 @@ class World2ActionPipeline(BasePipeline):
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
         }[config.precision]
-        pipe.tensor_kwargs = {"device": "cuda", "dtype": pipe.precision}
+        pipe.tensor_kwargs = {"device": device, "dtype": pipe.precision}
         log.warning(f"precision {pipe.precision}")
 
         # 2. setup up denoising scheduler
@@ -96,7 +97,7 @@ class World2ActionPipeline(BasePipeline):
             log.success(f"Successfully loaded DiT from {dit_path}")
 
         else:
-            pipe.dit.to_empty(device="cuda")
+            pipe.dit.to_empty(device=device)
             pipe.dit.init_weights()
             log.warning("dit_path not provided, initializing DiT with random weights")
 
@@ -115,7 +116,7 @@ class World2ActionPipeline(BasePipeline):
             pipe.dit_ema_worker.copy_to(src_model=pipe.dit, tgt_model=pipe.dit_ema)
 
         pipe.dit = pipe.dit.to(device=device, dtype=dtype)
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
         # 5. training states
         if parallel_state.is_initialized():

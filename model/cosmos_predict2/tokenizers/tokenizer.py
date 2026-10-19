@@ -23,6 +23,7 @@ from einops import rearrange
 
 from cosmos_predict2.tokenizers.interface import VideoTokenizerInterface
 from imaginaire.utils import log
+from imaginaire.utils.accelerator import amp_autocast
 from imaginaire.utils.distributed import broadcast, get_rank, sync_model_states
 from imaginaire.utils.easy_io import easy_io
 
@@ -788,7 +789,7 @@ class VAE:
             self.model = self.model.to(dtype=dtype)
             self.context = nullcontext()
         else:
-            self.context = torch.amp.autocast("cuda", dtype=dtype)
+            self.context = amp_autocast(self.device, dtype=dtype)
 
     def count_param(self):
         return sum(p.numel() for p in self.model.parameters())
@@ -1052,11 +1053,19 @@ class CosmosImageTokenizer(torch.nn.Module, VideoTokenizerInterface):
 
 
 class TokenizerInterface(VideoTokenizerInterface):
-    def __init__(self, chunk_duration: int = 81, load_mean_std=False, **kwargs):
+    def __init__(
+        self,
+        chunk_duration: int = 81,
+        load_mean_std=False,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+        **kwargs,
+    ):
         self.model = VAE(
-            dtype=torch.bfloat16,
+            dtype=dtype,
             is_amp=False,
             load_mean_std=load_mean_std,
+            device=device,
             vae_pth=kwargs.get(
                 "vae_pth",
                 "",

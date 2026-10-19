@@ -22,11 +22,22 @@ import torch
 from torch._C import _graph_pool_handle
 from torch.utils._pytree import tree_flatten as _tree_flatten
 from torch.utils._pytree import tree_unflatten as _tree_unflatten
-from transformer_engine.pytorch.distributed import (
-    get_all_rng_states,
-    graph_safe_rng_available,
-)
-from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
+
+try:  # Transformer Engine is CUDA-only; CUDA Graphs are unavailable without it anyway.
+    from transformer_engine.pytorch.distributed import (
+        get_all_rng_states,
+        graph_safe_rng_available,
+    )
+    from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
+
+    TE_GRAPH_AVAILABLE = True
+except ImportError:  # pragma: no cover - XPU / CPU / CUDA without TE
+    TE_GRAPH_AVAILABLE = False
+    get_all_rng_states = None
+    graph_safe_rng_available = None
+
+    class TransformerEngineBaseModule:  # placeholder so isinstance() checks stay valid
+        pass
 
 from imaginaire.utils import log
 
@@ -381,6 +392,11 @@ def create_cuda_graph(
     adaln_lora_B_3D: torch.Tensor | None,
     extra_per_block_pos_emb: torch.Tensor | None,
 ) -> str:
+    if not TE_GRAPH_AVAILABLE:
+        raise RuntimeError(
+            "CUDA Graphs require Transformer Engine, which is not installed. "
+            "Callers should check imaginaire.utils.accelerator.cuda_graphs_supported() first."
+        )
     real_args = [arg for arg in [x, affline_emb_B_D, crossattn_emb] if arg is not None]
     real_kwargs = {
         k: v
